@@ -322,6 +322,13 @@ def edgar_records(facts: dict):
     for e in _edgar_entries(facts, "us-gaap", ["AssetsCurrent", "Assets"], "USD"):
         if e.get("fp") in FP_TO_Q and e["end"] > period_of_accn.get(e["accn"], ("",))[0]:
             period_of_accn[e["accn"]] = (e["end"], e["fy"], FP_TO_Q[e["fp"]])
+    # 회사가 회계연도를 잘못 적은 공시(PRTH 43830 = 엑셀 날짜 일련번호, WTBA 2107 등)는
+    # 같은 회사의 다른 공시에서 흔한 '회계연도 − 종료일 연도' 차이로 다시 계산
+    offsets = [fy - int(end[:4]) for end, fy, _ in period_of_accn.values() if fy and abs(fy - int(end[:4])) <= 1]
+    offset = max(set(offsets), key=offsets.count) if offsets else 0
+    for accn, (end, fy, q) in period_of_accn.items():
+        if not fy or abs(fy - int(end[:4])) > 1:
+            period_of_accn[accn] = (end, int(end[:4]) + offset, q)
     periods = {end: (fy, q) for end, fy, q in period_of_accn.values()}
     ends = sorted(periods)
 
