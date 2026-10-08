@@ -316,8 +316,8 @@ def _days(e):
     return (date.fromisoformat(e["end"]) - date.fromisoformat(e["start"])).days
 
 
-def edgar_records(facts: dict):
-    # 각 공시(accn)의 보고 기간 종료일과 회계연도/분기 결정
+def edgar_periods(facts: dict) -> dict:
+    """각 공시(accn)의 보고 기간 종료일과 회계연도·분기. 반환: {accn: (종료일, 회계연도, 분기)}"""
     period_of_accn = {}
     for e in _edgar_entries(facts, "us-gaap", ["AssetsCurrent", "Assets"], "USD"):
         if e.get("fp") in FP_TO_Q and e["end"] > period_of_accn.get(e["accn"], ("",))[0]:
@@ -329,6 +329,11 @@ def edgar_records(facts: dict):
     for accn, (end, fy, q) in period_of_accn.items():
         if not fy or abs(fy - int(end[:4])) > 1:
             period_of_accn[accn] = (end, int(end[:4]) + offset, q)
+    return period_of_accn
+
+
+def edgar_records(facts: dict):
+    period_of_accn = edgar_periods(facts)
     periods = {end: (fy, q) for end, fy, q in period_of_accn.values()}
     ends = sorted(periods)
 
@@ -697,19 +702,59 @@ def annual_buyback_from_xbrl(parsed: dict) -> dict:
 
     1년짜리 기간(350~380일)만 쓰고, 보고기간 종료일과의 차이(년)로 회계연도를 매긴다.
     """
-    if not parsed["fy"] or not parsed["period_end"]:
+    fy = _doc_fy(parsed)
+    if not fy:
         return {}
     doc_end = date.fromisoformat(parsed["period_end"])
     out = {}
     for start, end in {(f["start"], f["end"]) for f in parsed["facts"]}:
         if not 350 <= _days({"start": start, "end": end}) <= 380:
             continue
-        years_back = round((doc_end - date.fromisoformat(end)).days / 365.25)
-        if years_back < 0 or abs((doc_end - date.fromisoformat(end)).days - years_back * 365.25) > 20:
+        years_back = _years_back(doc_end, end)
+        if years_back is None:
             continue
         value, source = pick_buyback_shares(parsed["facts"], start, end)
         if value is not None:
-            out[parsed["fy"] - years_back] = (value, source)
+            out[fy - years_back] = (value, source)
+    return out
+
+
+def _doc_fy(parsed: dict):
+    """10-K의 회계연도. 회사가 잘못 적은 경우(보고기간 종료 연도와 0·−1년 차이가 아님, 14,898건 중 15건)는
+    종료일 3개월 전이 속한 연도로 다시 매긴다 (1월 초에 끝나는 52·53주 회계연도도 앞 연도가 되도록)."""
+    if not parsed.get("fy") or not parsed.get("period_end"):
+        return None
+    end = date.fromisoformat(parsed["period_end"])
+    if parsed["fy"] - end.year in (0, -1):
+        return parsed["fy"]
+    return end.year if end.month > 3 else end.year - 1
+
+
+def quarter_buyback_from_xbrl(parsed: dict, end: str, fy: int, q: int) -> dict:
+    """10-Q(또는 10-K) 한 건에서 분기 자사주매입 주식수 후보. 반환: {("3m"|"ytd", 회계연도, 분기): (값, 출처)}
+
+    end·fy·q는 companyfacts 기준 이 공시의 보고기간 종료일·회계연도·분기(10-K는 4).
+    이번 기간과 1년 전 비교 기간에서 3개월 값(80~100일)과 연초부터 누적값(분기 × 약 91일)을 읽는다.
+    1분기는 3개월 값이 곧 누적값이다.
+    """
+    doc_end = date.fromisoformat(end)
+    out = {}
+    for start, period_end in {(f["start"], f["end"]) for f in parsed.get("facts", [])}:
+        years_back = _years_back(doc_end, period_end)
+        if years_back not in (0, 1):
+            continue
+        days = _days({"start": start, "end": period_end})
+        kinds = []
+        if 80 <= days <= 100:
+            kinds.append("3m")
+        if abs(days - q * 91.3) <= 20 or (q == 4 and 350 <= days <= 380):
+            kinds.append("ytd")
+        if not kinds:
+            continue
+        value, source = pick_buyback_shares(parsed["facts"], start, period_end)
+        if value is not None:
+            for kind in kinds:
+                out[(kind, fy - years_back, q)] = (value, source)
     return out
 
 
@@ -726,7 +771,8 @@ def treasury_increase_from_xbrl(parsed: dict) -> dict:
     매입량의 추정치: 그 해에 소각하거나 직원 보상으로 다시 내준 주식이 있으면 실제 매입보다 작게 나온다.
     잔액이 줄었거나 그대로면 추정하지 않는다. 같은 항목으로 기초·기말이 다 있어야 한다.
     """
-    if not parsed.get("fy") or not parsed.get("period_end") or not parsed.get("treasury"):
+    fy = _doc_fy(parsed)
+    if not fy or not parsed.get("treasury"):
         return {}
     doc_end = date.fromisoformat(parsed["period_end"])
     for tag in TREASURY_BALANCE_TAGS:
@@ -751,7 +797,7 @@ def treasury_increase_from_xbrl(parsed: dict) -> dict:
         out = {}
         for k, end_bal in balances.items():
             if k + 1 in balances and int(end_bal - balances[k + 1]) > 0:
-                out[parsed["fy"] - k] = (int(end_bal - balances[k + 1]), f"추정: XBRL {tag} 기말-기초")
+                out[fy - k] = (int(end_bal - balances[k + 1]), f"추정: XBRL {tag} 기말-기초")
         if out:
             return out
     return {}

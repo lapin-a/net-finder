@@ -73,6 +73,12 @@ python main.py analyze-edgar-batch A
 # EDGAR 연간 자사주매입 주식수 빈칸을 10-K XBRL 원문으로 채움 (글자 생략 시 전체)
 python main.py fill-edgar-buyback A B
 
+# 이미 XBRL·추정으로 채운 칸도 지금 규칙으로 다시 확인 (규칙을 고친 뒤)
+python main.py fill-edgar-buyback --recheck
+
+# EDGAR 분기 자사주매입 주식수 빈칸(·금액이 있는데 0주)을 10-Q·10-K XBRL 원문으로 채움
+python main.py fill-edgar-buyback-quarterly A B
+
 # companyfacts 자사주매입 주식수 중 이상한 값(음수, 0주, 평균 매입가 이상)을 XBRL 원문 값으로 교체
 python main.py fix-edgar-buyback
 
@@ -157,7 +163,8 @@ python main.py edgar-facts AAPL                          # XBRL 재무 데이터
 **EDGAR 일괄**
 - 10-K/10-Q 제출 회사만 대상입니다. 해외 기업(20-F, 40-F)과 재무 데이터가 없는 ETF·펀드 등은 빠지거나 `실패` 파일에 기록됩니다.
 - 분석에는 합친 파일 `data/analysis/edgar/{연간,분기}.csv`를 쓰세요. 같은 회사가 여러 티커로 들어간 경우 SEC 대표 티커 하나만 남기고 CIK 열을 붙였습니다. 글자별 파일은 작업용으로, 빈칸 채우기·교체는 글자별 파일에 한 뒤 `merge-edgar`로 다시 합칩니다.
-- 회사가 공시에 회계연도를 잘못 적은 경우(엑셀 날짜 일련번호 `43830`, `2107` 등)는 보고기간 종료일과 1년 넘게 어긋나면 같은 회사의 평소 차이로 다시 계산합니다.
+- 회사가 공시에 회계연도를 잘못 적은 경우(엑셀 날짜 일련번호 `43830`, `2107` 등)는 보고기간 종료일과 1년 넘게 어긋나면 같은 회사의 평소 차이로 다시 계산합니다. XBRL 원문의 회계연도(`DocumentFiscalYearFocus`)가 틀린 10-K(약 0.1%)는 종료일 3개월 전이 속한 연도로 매깁니다.
+- 분기 주식수 채우기(`fill-edgar-buyback-quarterly`)는 companyfacts의 공시별 회계연도·분기로 10-Q를 골라, 3개월 값 → 누적값 − 직전 분기 누적값 → 다음 해 같은 분기 공시의 전년 비교값 순으로 찾습니다. 4분기는 10-K 연간값 − 3분기 누적값입니다. 채운 뒤 연초누적과 전년 동기 대비를 다시 계산합니다.
 
 ## 구조
 

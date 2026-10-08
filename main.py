@@ -18,6 +18,8 @@
     python main.py detect-splits                 # 일괄 결과에서 주식분할·병합 후보 탐지
     python main.py fill-edgar-buyback            # EDGAR 일괄 결과의 연간 자사주매입 주식수 빈칸을 10-K XBRL 원문으로 채움
     python main.py fill-edgar-buyback A B        # 해당 글자 파일만
+    python main.py fill-edgar-buyback --recheck  # 이미 XBRL·추정으로 채운 칸도 지금 규칙으로 다시 확인
+    python main.py fill-edgar-buyback-quarterly  # 분기 자사주매입 주식수 빈칸(·0주)을 10-Q·10-K XBRL 원문으로 채움
     python main.py fix-edgar-buyback             # companyfacts 자사주매입 주식수 중 이상한 값을 XBRL 원문 값으로 교체
     python main.py refresh-edgar PRTH WTBA       # 일부 회사만 companyfacts로 다시 계산해 글자별 파일에 반영
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
@@ -141,7 +143,7 @@ BUYBACK_PRICE_RANGE = (0.1, 10_000)  # 달러/주
 
 
 def _parsed_10k(edgar: EdgarClient, cik: str, accn: str) -> dict:
-    """10-K XBRL 원문에서 뽑은 자사주매입 후보 (data/cache/edgar_xbrl에 저장해 두고 재사용)."""
+    """10-K·10-Q XBRL 원문에서 뽑은 자사주매입 후보 (data/cache/edgar_xbrl에 저장해 두고 재사용)."""
     cache = DATA_DIR / "cache/edgar_xbrl" / f"{accn}.json"
     if cache.exists():
         parsed = json.loads(cache.read_text(encoding="utf-8"))
@@ -238,6 +240,126 @@ def refresh_edgar_tickers(edgar: EdgarClient, tickers: list[str]) -> None:
                 save_csv(f"analysis/edgar/{path.name}", rows, list(rows[0]))
 
 
+def _search_quarter_buyback(edgar: EdgarClient, cik: str, gaps: set, no_buyback: set) -> tuple[dict, int]:
+    """한 회사의 빈 분기들을 10-Q·10-K XBRL 원문에서 찾는다. 반환: ({(회계연도, 분기): (주식수, 출처)}, 확인한 공시 수)
+
+    분기는 companyfacts의 공시별 회계연도·분기(분기표와 같은 기준)로 공시를 고른다. 찾는 순서:
+    1) 그 분기 공시의 3개월 값  2) 누적값 − 직전 분기 누적값 (직전 분기까지 매입이 없었으면 누적값 그대로)
+    3) 다음 해 같은 분기 공시의 전년 비교값. 4분기는 10-K 연간값 − 3분기 누적값.
+    no_buyback: 매입 금액이 0이거나 없는 분기 (누적값 차감 때 0주로 봄)
+    """
+    periods = analysis.edgar_periods(edgar.company_facts(cik))
+    accns = {}
+    for accn, (end, fy, q) in sorted(periods.items(), key=lambda x: x[0]):
+        accns.setdefault((fy, q), []).append((accn, end))
+    values, loaded, searched = {}, set(), 0
+
+    def load(fy, q):
+        nonlocal searched
+        if (fy, q) in loaded:
+            return
+        loaded.add((fy, q))
+        for accn, end in accns.get((fy, q), []):
+            parsed = _parsed_10k(edgar, cik, accn)
+            searched += 1
+            if "error" not in parsed:
+                for key, value in analysis.quarter_buyback_from_xbrl(parsed, end, fy, q).items():
+                    values.setdefault(key, value)
+
+    def ytd(fy, q):
+        if q == 0 or all((fy, k) in no_buyback for k in range(1, q + 1)):
+            return 0, None
+        load(fy, q)
+        return values.get(("ytd", fy, q)) or (None, None)
+
+    found = {}
+    for fy, q in sorted(gaps):
+        load(fy, q)
+        if ("3m", fy, q) in values:
+            value, source = values[("3m", fy, q)]
+            found[(fy, q)] = (value, f"{source}, 3개월")
+            continue
+        cum, source = values.get(("ytd", fy, q)) or (None, None)
+        if cum is not None and q > 1:
+            prev, _ = ytd(fy, q - 1)
+            if prev is not None and cum - prev > 0:
+                found[(fy, q)] = (cum - prev, f"{source}, 누적 차감")
+                continue
+        load(fy + 1, q)
+        if ("3m", fy, q) in values:
+            value, source = values[("3m", fy, q)]
+            found[(fy, q)] = (value, f"{source}, 다음 해 비교값")
+        elif q == 1 and ("ytd", fy, q) in values:
+            value, source = values[("ytd", fy, q)]
+            found[(fy, q)] = (value, f"{source}, 다음 해 비교값")
+    return found, searched
+
+
+def fill_edgar_buyback_quarterly(edgar: EdgarClient, letters: list[str], workers: int = 6) -> None:
+    """EDGAR 일괄 분기표에서 자사주매입 금액은 있는데 주식수가 비었거나 0주인 칸을 10-Q·10-K XBRL 원문으로 채운다.
+
+    채운 뒤 연초누적과 전년 동기 대비를 다시 계산한다. 출처는 '자사주매입주식수(분기)_출처' 열.
+    """
+    ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
+    num, (lo, hi) = analysis._num, BUYBACK_PRICE_RANGE
+    src_col = "자사주매입주식수(분기)_출처"
+    paths = _letter_paths("분기")
+    if letters:
+        paths = [p for p in paths if p.stem.split("_")[1] in {l.upper() for l in letters}]
+
+    for path in paths:
+        rows = _load_csv(path)
+        gaps, no_buyback = {}, {}
+        for r in rows:
+            if r.get(src_col) is None:
+                r[src_col] = "companyfacts" if r["자사주매입주식수(분기)"] != "" else ""
+            fy, q = int(r["기간"][:4]), int(r["기간"][-1])
+            a, s = num(r["자사주매입(분기)"]), num(r["자사주매입주식수(분기)"])
+            if not a or a <= 0:
+                no_buyback.setdefault(r["티커"], set()).add((fy, q))
+            elif (s is None and r[src_col] == "") or (s == 0 and r[src_col] == "companyfacts"):
+                gaps.setdefault(r["티커"], set()).add((fy, q))
+
+        filled = searched = rejected = failed = 0
+        jobs = [(t, ciks[t], g) for t, g in gaps.items() if t in ciks]
+        by_key = {(r["티커"], r["기간"]): r for r in rows}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_search_quarter_buyback, edgar, cik, g, no_buyback.get(t, set())) for t, cik, g in jobs]
+            for i, ((ticker, _, _), future) in enumerate(zip(jobs, futures), 1):
+                try:
+                    found, n = future.result()
+                except Exception as e:  # companyfacts가 없어진 회사 등
+                    failed += 1
+                    print(f"{ticker}: {str(e)[:100]}", flush=True)
+                    continue
+                searched += n
+                for (fy, q), (shares, source) in found.items():
+                    r = by_key[(ticker, f"{fy}Q{q}")]
+                    if not lo <= num(r["자사주매입(분기)"]) / shares <= hi:
+                        rejected += 1
+                        continue
+                    r["자사주매입주식수(분기)"], r[src_col] = shares, source
+                    filled += 1
+                if i % 50 == 0:
+                    print(f"{path.stem}: {i}/{len(jobs)}개 회사, 공시 {searched}건 확인, {filled}칸 채움", flush=True)
+
+        # 연초누적·전년 동기 대비 다시 계산
+        for r in rows:
+            fy, q = int(r["기간"][:4]), int(r["기간"][-1])
+            parts = [by_key.get((r["티커"], f"{fy}Q{k}"), {}).get("자사주매입주식수(분기)", "") for k in range(1, q + 1)]
+            r["자사주매입주식수(연초누적)"] = "" if "" in parts else sum(num(v) for v in parts)
+        for r in rows:
+            prev = by_key.get((r["티커"], f"{int(r['기간'][:4]) - 1}{r['기간'][4:]}"))
+            r["자사주매입주식수_전년동기대비(%)"] = analysis._growth(num(r["자사주매입주식수(연초누적)"]),
+                                                         num(prev and prev["자사주매입주식수(연초누적)"]))
+        fields = [k for k in rows[0] if k != src_col] if rows else []
+        if fields:
+            fields.insert(fields.index("자사주매입주식수(분기)") + 1, src_col)
+        save_csv(f"analysis/edgar/{path.name}", rows, fields)
+        print(f"{path.stem}: 빈칸 {sum(len(g) for g in gaps.values())}칸 중 {filled}칸 채움, "
+              f"평균 매입가 이상으로 제외 {rejected}칸, 실패 {failed}개 회사 (공시 {searched}건 확인)", flush=True)
+
+
 def fix_edgar_buyback(edgar: EdgarClient, workers: int = 6) -> None:
     """companyfacts에서 온 자사주매입 주식수 중 이상한 값을 10-K XBRL 원문 값으로 바꾼다.
 
@@ -263,7 +385,12 @@ def fix_edgar_buyback(edgar: EdgarClient, workers: int = 6) -> None:
         suspects = {}  # 행 번호 → 이유
         for i, r in enumerate(rows):
             a, s = num(r["자사주매입"]), num(r["자사주매입주식수"])
-            if r["자사주매입주식수_출처"] != "companyfacts" or not a or a <= 0 or s is None:
+            if r["자사주매입주식수_출처"] != "companyfacts" or s is None:
+                continue
+            if not a or a <= 0:
+                if s < 0:  # 금액이 없어 맞는 값을 확인할 수 없는 음수
+                    r["자사주매입주식수"], r["자사주매입주식수_출처"] = "", f"제외: companyfacts {s:g} (음수, 금액 없음)"
+                    stats[("음수(금액 없음)", "비움")] = stats.get(("음수(금액 없음)", "비움"), 0) + 1
                 continue
             med = near_median(r)
             if s < 0:
@@ -341,12 +468,13 @@ def merge_edgar(edgar: EdgarClient) -> None:
         print(f"{kind}: 회사 {len(by_company)}곳, 같은 회사의 다른 티커 {len(dropped)}개 제외: {', '.join(sorted(dropped))}")
 
 
-def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6) -> None:
+def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6, recheck: bool = False) -> None:
     """EDGAR 일괄 연간표에서 자사주매입 금액은 있는데 주식수가 빈 칸을 10-K XBRL 원문으로 채운다.
 
     10-K 자본변동표에는 3개년이 들어 있으므로 최신 10-K부터 거꾸로 내려가며, 빈 연도가 다 채워지거나
     더 볼 10-K가 없으면 멈춘다. 결과는 원래 파일에 덮어쓰고 '자사주매입주식수_출처' 열을 붙인다.
     회사 workers개를 동시에 처리하되, 요청 간격은 EdgarClient가 스레드 전체를 합쳐 지킨다.
+    recheck면 이미 XBRL·추정으로 채운 칸도 지금 규칙으로 다시 구해 바뀐 값은 고치고, 못 구하면 비운다.
     """
     ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
     paths = _letter_paths("연간")
@@ -355,23 +483,44 @@ def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6)
 
     for path in paths:
         rows = _load_csv(path)
-        gaps = {}
+        gaps, rechecks = {}, {}  # rechecks: (티커, 연도) → 행
         for r in rows:
             if r.get("자사주매입주식수_출처") is None:
                 r["자사주매입주식수_출처"] = "companyfacts" if r["자사주매입주식수"] != "" else ""
             amount = analysis._num(r["자사주매입"])
-            if amount and amount > 0 and r["자사주매입주식수"] == "" and r["자사주매입주식수_출처"] == "":
+            source = r["자사주매입주식수_출처"]
+            if amount and amount > 0 and r["자사주매입주식수"] == "" and source == "":
                 gaps.setdefault(r["티커"], set()).add(int(r["연도"]))
+            elif recheck and (source.startswith("XBRL") or source.startswith("추정")):
+                gaps.setdefault(r["티커"], set()).add(int(r["연도"]))
+                rechecks[(r["티커"], int(r["연도"]))] = r
 
-        filled = searched = rejected = estimated = 0
+        filled = searched = rejected = estimated = changed = cleared = 0
         jobs = [(ticker, ciks[ticker], years) for ticker, years in gaps.items() if ticker in ciks]
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_search_10k_buyback, edgar, cik, years) for _, cik, years in jobs]
             for i, ((ticker, _, _), future) in enumerate(zip(jobs, futures), 1):
                 found, n = future.result()
                 searched += n
+                for (t, year), r in rechecks.items():
+                    if t != ticker:
+                        continue
+                    old_value, old_source = r["자사주매입주식수"], r["자사주매입주식수_출처"]
+                    replaced = old_source.partition(", companyfacts ")[2]  # fix-edgar-buyback이 바꾼 칸
+                    new = found.get(year)
+                    if new and replaced and new[1].startswith("추정"):
+                        new = None  # 교체는 실제 매입 항목으로만
+                    if new and BUYBACK_PRICE_RANGE[0] <= analysis._num(r["자사주매입"]) / new[0] <= BUYBACK_PRICE_RANGE[1]:
+                        source = f"{new[1]}, companyfacts {replaced}" if replaced else new[1]
+                        if str(new[0]) != str(old_value) or source != old_source:
+                            r["자사주매입주식수"], r["자사주매입주식수_출처"] = new[0], source
+                            changed += 1
+                    else:
+                        r["자사주매입주식수"] = ""
+                        r["자사주매입주식수_출처"] = f"제외: companyfacts {replaced} (재검토)" if replaced else ""
+                        cleared += 1
                 for r in rows:
-                    if r["티커"] == ticker and int(r["연도"]) in found:
+                    if r["티커"] == ticker and int(r["연도"]) in found and (ticker, int(r["연도"])) not in rechecks:
                         shares, source = found[int(r["연도"])]
                         # 회사가 단위를 잘못 적은 값 거르기: 평균 매입가가 $0.10~$10,000 밖이면 채우지 않음
                         if not BUYBACK_PRICE_RANGE[0] <= analysis._num(r["자사주매입"]) / shares <= BUYBACK_PRICE_RANGE[1]:
@@ -397,7 +546,9 @@ def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6)
                 dropped += 1
 
         _save_edgar_annual(path, rows)
-        print(f"{path.stem}: 빈칸 {sum(len(y) for y in gaps.values())}칸 중 {filled}칸 채움(추정 {estimated}칸), "
+        if recheck:
+            print(f"{path.stem}: 재검토 {len(rechecks)}칸 중 바뀜 {changed}칸, 못 구해 비움 {cleared}칸", flush=True)
+        print(f"{path.stem}: 빈칸 {sum(len(y) for y in gaps.values()) - len(rechecks)}칸 중 {filled}칸 채움(추정 {estimated}칸), "
               f"평균 매입가 이상으로 제외 {rejected}칸, 인접 연도와 안 맞는 추정치 비움 {dropped}칸 (10-K {searched}건 확인)", flush=True)
 
 
@@ -551,7 +702,10 @@ def main(argv: list[str]) -> None:
         detect_splits()
 
     elif cmd == "fill-edgar-buyback":
-        fill_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
+        fill_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), [a for a in args if a != "--recheck"],
+                           recheck="--recheck" in args)
+    elif cmd == "fill-edgar-buyback-quarterly":
+        fill_edgar_buyback_quarterly(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
     elif cmd == "fix-edgar-buyback":
         fix_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
     elif cmd == "refresh-edgar":
