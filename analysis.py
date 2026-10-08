@@ -369,6 +369,53 @@ def edgar_records(facts: dict):
     return quarters, annual
 
 
+# ---------------------------------------------------------------- 주식분할 탐지
+
+SPLIT_MIN_RATIO = 1.5   # 이보다 작은 변화는 분할로 보지 않음
+SPLIT_TOLERANCE = 0.03  # 배율이 정수(또는 x.5)에서 3% 이내면 분할/병합으로 판단
+
+
+def _near_split_ratio(ratio):
+    """1.5, 2, 2.5, 3, 4, 5, 10, 50 처럼 분할에 쓰이는 배율에 가까우면 그 값, 아니면 None.
+    3배 미만은 0.5 단위(1.5, 2.5), 3배 이상은 정수만 인정 (13.29 → 13.5 같은 오탐 방지)."""
+    nearest = round(ratio * 2) / 2 if ratio < 3 else float(round(ratio))
+    return nearest if nearest >= SPLIT_MIN_RATIO and abs(ratio / nearest - 1) <= SPLIT_TOLERANCE else None
+
+
+def detect_splits(rows: list[dict], id_keys: tuple[str, ...], period_key: str = "기간",
+                  shares_key: str = "발행주식수") -> list[dict]:
+    """분기표에서 연속된 두 분기 사이 발행주식수가 정수배로 바뀐 지점을 찾는다.
+
+    rows: 분기표 행(회사 식별 열 + 기간 + 발행주식수). 회사별로 기간 순 정렬돼 있다고 가정하지 않음.
+    """
+    by_company = {}
+    for r in rows:
+        if r.get(shares_key) not in ("", None):
+            by_company.setdefault(tuple(r[k] for k in id_keys), []).append(r)
+
+    found = []
+    for company, items in by_company.items():
+        items.sort(key=lambda r: r[period_key])
+        for prev, cur in zip(items, items[1:]):
+            before, after = float(prev[shares_key]), float(cur[shares_key])
+            if before <= 0 or after <= 0:
+                continue
+            ratio = after / before
+            if (n := _near_split_ratio(ratio)) is not None:
+                kind, label = "분할", f"{n:g}:1"
+            elif (n := _near_split_ratio(1 / ratio)) is not None:
+                kind, label = "병합", f"1:{n:g}"
+            else:
+                continue
+            found.append({
+                **dict(zip(id_keys, company)),
+                "이전기간": prev[period_key], "이후기간": cur[period_key],
+                "이전주식수": int(before), "이후주식수": int(after),
+                "종류": kind, "배율": label, "실제배율": round(ratio, 4),
+            })
+    return found
+
+
 # ---------------------------------------------------------------- 분석표
 
 CAGR_YEARS = (3, 5, 10)

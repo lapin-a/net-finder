@@ -15,6 +15,7 @@
     python main.py analyze-edgar-batch A         # 티커가 A로 시작하는 회사 전체
     python main.py analyze-dart-batch 2015 2025  # 상장사 전체 (유동자산·총부채·순이익 + KRX 발행주식수)
     python main.py analyze-dart-batch 2015 2025 --buyback 2025 2024  # + 연간 자사주매입 (회사별 호출)
+    python main.py detect-splits                 # 일괄 결과에서 주식분할·병합 후보 탐지
 """
 import csv
 import json
@@ -123,7 +124,27 @@ def analyze_edgar_batch(edgar: EdgarClient, prefix: str) -> None:
     save_csv(f"analysis/{tag}_실패.csv", failed, ["ticker", "name", "cik", "error"])
 
 
-QUARTER_ENDS = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+def detect_splits() -> None:
+    """일괄 분석 결과(분기표)의 발행주식수 변화로 주식분할·병합 후보를 찾는다. API 호출 없음."""
+    def load(path):
+        with path.open(encoding="utf-8-sig") as f:
+            return list(csv.DictReader(f))
+
+    out_fields = ["이전기간", "이후기간", "이전주식수", "이후주식수", "종류", "배율", "실제배율"]
+    dart_path = DATA_DIR / "analysis/dart/batch_상장사_분기.csv"
+    if dart_path.exists():
+        found = analysis.detect_splits(load(dart_path), ("종목코드", "회사명"))
+        save_csv("analysis/splits_dart.csv", found, ["종목코드", "회사명"] + out_fields)
+
+    edgar_rows = []
+    for path in sorted((DATA_DIR / "analysis/edgar").glob("batch_*_분기.csv")):
+        edgar_rows += load(path)
+    if edgar_rows:
+        found = analysis.detect_splits(edgar_rows, ("티커", "회사명"))
+        save_csv("analysis/splits_edgar.csv", found, ["티커", "회사명"] + out_fields)
+
+
+QUARTER_ENDS ={1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
 
 
 def fill_krx_shares(results: dict, corps: dict, start: int, end: int) -> None:
@@ -213,6 +234,9 @@ def main(argv: list[str]) -> None:
             save(f"dart/fs_{corp_code}_{year}.json", dart.financial_statements(corp_code, year))
         else:
             sys.exit(f"알 수 없는 명령: {cmd}")
+
+    elif cmd == "detect-splits":
+        detect_splits()
 
     elif cmd == "analyze-dart-batch":
         # 예: analyze-dart-batch 2015 2025 --buyback 2025 2024  (자사주매입은 적힌 연도 순서대로 수집)
