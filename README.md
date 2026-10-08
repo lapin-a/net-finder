@@ -75,6 +75,23 @@ python main.py analyze-edgar-batch A
 
 API 응답은 `data/cache/`에 저장됩니다. 한도 초과나 네트워크 오류로 멈춰도 같은 명령을 다시 실행하면 받은 부분은 건너뛰고 이어서 받습니다. DART 일일 한도(오류 020)에 걸리면 거기까지 저장하고 멈춥니다.
 
+### 넷넷 스크리너 (한국)
+
+`analyze-dart-batch` 연간 결과에 KRX 종가·시가총액을 붙여 조건을 통과한 종목만 저장합니다. DART 호출은 없습니다.
+
+```bash
+python main.py screen-dart                   # 최신 연도, 기본 조건
+python main.py screen-dart 2024 --ratio 1 --profit 흑자 --profit-years 5 --no-buyback
+python main.py screen-dart 2025 --price-date 20261007   # 연말 대신 해당일(직전 거래일) 주가
+```
+
+기본 조건 (모두 만족):
+- 시가총액 ÷ (유동자산 − 총부채) ≤ 2/3 (`--ratio`). 시가총액은 보통주와 우선주를 합친 값이고, 순유동자산이 0 이하면 제외합니다.
+- 최근 3년 순이익 상태가 흑자 또는 흑자전환 (`--profit`, `--profit-years`)
+- 자사주매입 주식수가 전년보다 많음 (`--no-buyback`으로 끔). 매입 데이터는 `--buyback`으로 받은 연도에만 있어서, 현재는 2025년만 이 조건을 적용할 수 있습니다.
+
+→ `data/analysis/dart/screen_<연도>_<주가기준일>.csv` (시총÷순유동자산이 낮은 순). 조건만 바꿔 다시 실행하면 같은 파일을 덮어씁니다.
+
 ### 원본 데이터
 
 ```bash

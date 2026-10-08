@@ -16,6 +16,11 @@
     python main.py analyze-dart-batch 2015 2025  # 상장사 전체 (유동자산·총부채·순이익 + KRX 발행주식수)
     python main.py analyze-dart-batch 2015 2025 --buyback 2025 2024  # + 연간 자사주매입 (회사별 호출)
     python main.py detect-splits                 # 일괄 결과에서 주식분할·병합 후보 탐지
+
+    # 넷넷 스크리너 (analyze-dart-batch 결과 + KRX 종가·시가총액)
+    python main.py screen-dart                   # 최신 연도, 기본 조건
+    python main.py screen-dart 2024 --ratio 1 --profit 흑자 --profit-years 5 --no-buyback
+    python main.py screen-dart 2025 --price-date 20261007   # 연말 대신 해당일(직전 거래일) 주가로 비교
 """
 import csv
 import json
@@ -144,6 +149,42 @@ def detect_splits() -> None:
         save_csv("analysis/splits_edgar.csv", found, ["티커", "회사명"] + out_fields)
 
 
+def screen_dart(args: list[str]) -> None:
+    """넷넷 스크리너. 옵션:
+    [연도]               기본: 연간 일괄 결과의 최신 연도
+    --ratio R            시가총액 ÷ (유동자산 - 총부채) 상한 (기본 0.667 = 그레이엄 2/3)
+    --profit A,B         허용할 순이익 상태 (기본 흑자,흑자전환)
+    --profit-years N     순이익 상태를 볼 기간 3/5/10 (기본 3)
+    --no-buyback         자사주매입 주식수 전년 대비 증가 조건 끄기
+    --price-date YYYYMMDD  주가 기준일 (기본: 해당 연도 12월 31일, 휴장이면 직전 거래일)
+    """
+    def opt(name, default):
+        return args[args.index(name) + 1] if name in args else default
+
+    path = DATA_DIR / "analysis/dart/batch_상장사_연간.csv"
+    if not path.exists():
+        sys.exit(f"{path} 가 없습니다 → 먼저 analyze-dart-batch 를 실행하세요")
+    with path.open(encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+
+    positional = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or not args[i - 1].startswith("--"))]
+    year = int(positional[0]) if positional else max(int(r["연도"]) for r in rows if r["주당순유동자산"])
+    max_ratio = float(opt("--ratio", 2 / 3))
+    profit_status = set(opt("--profit", "흑자,흑자전환").split(","))
+    profit_years = int(opt("--profit-years", 3))
+    price_date = opt("--price-date", f"{year}1231")
+
+    krx = KrxClient(os.getenv("KRX_API_KEY", ""), cache_dir=DATA_DIR / "cache/krx")
+    bas_dd, market = krx.market_data(date(int(price_date[:4]), int(price_date[4:6]), int(price_date[6:])))
+    print(f"재무 {year}년 / 주가 기준일 {bas_dd}")
+
+    passed, stages = analysis.screen_net_net(rows, year, market, max_ratio, profit_years, profit_status,
+                                             buyback_up="--no-buyback" not in args)
+    for name, count in stages.items():
+        print(f"  {name}: {count}")
+    save_csv(f"analysis/dart/screen_{year}_{bas_dd}.csv", passed, list(passed[0]) if passed else ["종목코드"])
+
+
 QUARTER_ENDS ={1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
 
 
@@ -237,6 +278,9 @@ def main(argv: list[str]) -> None:
 
     elif cmd == "detect-splits":
         detect_splits()
+
+    elif cmd == "screen-dart":
+        screen_dart(args)
 
     elif cmd == "analyze-dart-batch":
         # 예: analyze-dart-batch 2015 2025 --buyback 2025 2024  (자사주매입은 적힌 연도 순서대로 수집)

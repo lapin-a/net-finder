@@ -56,24 +56,33 @@ class KrxClient:
             day -= timedelta(days=1)
         raise RuntimeError(f"{on_or_before} 이전 15일 안에 거래일이 없습니다")
 
-    def issued_shares(self, on_or_before: date) -> tuple[str, dict[str, int]]:
-        """전 시장 종목코드 → 상장주식수 (보통주 + 해당 우선주 합계).
+    def market_data(self, on_or_before: date) -> tuple[str, dict[str, dict]]:
+        """전 시장 종목코드 → {종가, 시가총액, 상장주식수}. 시가총액·주식수는 보통주 + 해당 우선주 합계.
 
         우선주는 종목코드 앞 5자리가 같고 이름이 보통주 이름으로 시작하면 보통주에 합산한다.
-        (예: 005930 삼성전자 + 005935 삼성전자우)
+        (예: 005930 삼성전자 + 005935 삼성전자우). 종가는 보통주 종가.
         """
         bas_dd, kospi = self.last_trading_day(on_or_before)
         rows = kospi + self.daily("KOSDAQ", bas_dd) + self.daily("KONEX", bas_dd)
 
+        def item(r):
+            return {"close": int(r["TDD_CLSPRC"]), "mktcap": int(r["MKTCAP"]), "shares": int(r["LIST_SHRS"])}
+
         commons = {r["ISU_CD"]: r for r in rows if r["ISU_CD"].endswith("0")}
-        shares = {code: int(r["LIST_SHRS"]) for code, r in commons.items()}
+        data = {code: item(r) for code, r in commons.items()}
         for r in rows:
             if r["ISU_CD"] in commons:
                 continue
             common = next((c for c in commons.values()
                            if c["ISU_CD"][:5] == r["ISU_CD"][:5] and r["ISU_NM"].startswith(c["ISU_NM"])), None)
             if common:
-                shares[common["ISU_CD"]] += int(r["LIST_SHRS"])
+                data[common["ISU_CD"]]["mktcap"] += int(r["MKTCAP"])
+                data[common["ISU_CD"]]["shares"] += int(r["LIST_SHRS"])
             else:
-                shares[r["ISU_CD"]] = int(r["LIST_SHRS"])
-        return bas_dd, shares
+                data[r["ISU_CD"]] = item(r)
+        return bas_dd, data
+
+    def issued_shares(self, on_or_before: date) -> tuple[str, dict[str, int]]:
+        """전 시장 종목코드 → 상장주식수 (보통주 + 해당 우선주 합계)."""
+        bas_dd, data = self.market_data(on_or_before)
+        return bas_dd, {code: d["shares"] for code, d in data.items()}

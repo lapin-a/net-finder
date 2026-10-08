@@ -474,3 +474,59 @@ def annual_table(annual: dict) -> list[dict]:
             rec.get("buyback_shares"), annual.get(year - 1, {}).get("buyback_shares"))
         rows.append(row)
     return rows
+
+
+def screen_net_net(annual_rows: list[dict], year: int, market: dict[str, dict], max_ratio: float,
+                   profit_years: int, profit_status: set[str], buyback_up: bool):
+    """연간 일괄 결과에서 넷넷 종목을 거른다.
+
+    시가총액 ÷ (유동자산 - 총부채) ≤ max_ratio, 최근 profit_years년 순이익 상태가 profit_status 중 하나,
+    (buyback_up이면) 자사주매입 주식수가 전년보다 많은 종목.
+    반환: (통과 행 목록, 단계별 남은 종목 수)
+    """
+    by_code = {}
+    for r in annual_rows:
+        by_code.setdefault(r["종목코드"], {})[int(r["연도"])] = r
+
+    stages = {"전체": 0, "순유동자산>0·주가있음": 0, f"비율≤{max_ratio:g}": 0, "순이익조건": 0, "자사주매입증가": 0}
+    passed = []
+    for code, years in by_code.items():
+        r = years.get(year)
+        if r is None:
+            continue
+        stages["전체"] += 1
+        ca, tl = _num(r["유동자산"]), _num(r["총부채"])
+        m = market.get(code)
+        if ca is None or tl is None or ca - tl <= 0 or not m:
+            continue
+        stages["순유동자산>0·주가있음"] += 1
+        ncav = ca - tl
+        ratio = m["mktcap"] / ncav
+        if ratio > max_ratio:
+            continue
+        stages[f"비율≤{max_ratio:g}"] += 1
+        status = r[f"순이익상태_{profit_years}년"]
+        if status not in profit_status:
+            continue
+        stages["순이익조건"] += 1
+        cur = _num(r["자사주매입주식수"])
+        prev = _num(years.get(year - 1, {}).get("자사주매입주식수"))
+        if buyback_up:
+            if cur is None or prev is None or cur <= prev:
+                continue
+            stages["자사주매입증가"] += 1
+        passed.append({
+            "종목코드": code, "회사명": r["회사명"], "연도": year,
+            "종가": m["close"], "시가총액": m["mktcap"],
+            "유동자산": ca, "총부채": tl, "순유동자산": ncav,
+            "주당순유동자산": round(ncav / m["shares"], 2),
+            "시총÷순유동자산": round(ratio, 3),
+            "순이익": _num(r["순이익"]),
+            f"순이익상태_{profit_years}년": status,
+            f"순이익CAGR_{profit_years}년(%)": _num(r[f"순이익CAGR_{profit_years}년(%)"]),
+            "자사주매입주식수": cur, "자사주매입주식수(전년)": prev,
+        })
+    if not buyback_up:
+        del stages["자사주매입증가"]
+    passed.sort(key=lambda x: x["시총÷순유동자산"])
+    return passed, stages
