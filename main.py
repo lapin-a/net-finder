@@ -16,6 +16,8 @@
     python main.py analyze-dart-batch 2015 2025  # 상장사 전체 (유동자산·총부채·순이익 + KRX 발행주식수)
     python main.py analyze-dart-batch 2015 2025 --buyback 2025 2024  # + 연간 자사주매입 (회사별 호출)
     python main.py detect-splits                 # 일괄 결과에서 주식분할·병합 후보 탐지
+    python main.py fill-edgar-buyback            # EDGAR 일괄 결과의 연간 자사주매입 주식수 빈칸을 10-K XBRL 원문으로 채움
+    python main.py fill-edgar-buyback A B        # 해당 글자 파일만
 
     # 넷넷 스크리너 (analyze-dart-batch 결과 + KRX 종가·시가총액)
     python main.py screen-dart                   # 최신 연도, 기본 조건
@@ -127,6 +129,97 @@ def analyze_edgar_batch(edgar: EdgarClient, prefix: str) -> None:
     save_csv(f"analysis/{tag}_분기.csv", q_all, list(q_all[0]) if q_all else [])
     save_csv(f"analysis/{tag}_연간.csv", a_all, list(a_all[0]) if a_all else [])
     save_csv(f"analysis/{tag}_실패.csv", failed, ["ticker", "name", "cik", "error"])
+
+
+BUYBACK_PRICE_RANGE = (0.1, 10_000)  # 달러/주
+
+
+def _parsed_10k(edgar: EdgarClient, cik: str, accn: str) -> dict:
+    """10-K XBRL 원문에서 뽑은 자사주매입 후보 (data/cache/edgar_xbrl에 저장해 두고 재사용)."""
+    cache = DATA_DIR / "cache/edgar_xbrl" / f"{accn}.json"
+    if cache.exists():
+        return json.loads(cache.read_text(encoding="utf-8"))
+    try:
+        parsed = analysis.xbrl_buyback_facts(edgar.filing_instance(cik, accn))
+    except (FileNotFoundError, SyntaxError) as e:  # XBRL 없는 옛 공시, 깨진 파일 (ParseError는 SyntaxError 하위)
+        parsed = {"error": str(e)[:200]}
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
+    return parsed
+
+
+def fill_edgar_buyback(edgar: EdgarClient, letters: list[str]) -> None:
+    """EDGAR 일괄 연간표에서 자사주매입 금액은 있는데 주식수가 빈 칸을 10-K XBRL 원문으로 채운다.
+
+    10-K 자본변동표에는 3개년이 들어 있으므로 최신 10-K부터 거꾸로 내려가며, 빈 연도가 다 채워지거나
+    더 볼 10-K가 없으면 멈춘다. 결과는 원래 파일에 덮어쓰고 '자사주매입주식수_출처' 열을 붙인다.
+    """
+    ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
+    paths = sorted((DATA_DIR / "analysis/edgar").glob("batch_*_연간.csv"))
+    if letters:
+        paths = [p for p in paths if p.stem.split("_")[1] in {l.upper() for l in letters}]
+
+    for path in paths:
+        with path.open(encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        gaps = {}
+        for r in rows:
+            if r.get("자사주매입주식수_출처") is None:
+                r["자사주매입주식수_출처"] = "companyfacts" if r["자사주매입주식수"] != "" else ""
+            amount = analysis._num(r["자사주매입"])
+            if amount and amount > 0 and r["자사주매입주식수"] == "" and r["자사주매입주식수_출처"] == "":
+                gaps.setdefault(r["티커"], set()).add(int(r["연도"]))
+
+        filled = searched = rejected = 0
+        for i, (ticker, years) in enumerate(gaps.items(), 1):
+            cik = ciks.get(ticker)
+            if not cik:
+                continue
+            found = {}
+            remaining = set(years)
+            tenks = sorted(edgar.filings(cik, ("10-K",), include_older=True),
+                           key=lambda x: x["reportDate"], reverse=True)
+            for filing in tenks:
+                if not remaining or not filing["reportDate"]:
+                    break
+                report_year = int(filing["reportDate"][:4])
+                if report_year < min(remaining) - 1:
+                    break
+                if not any(report_year - 3 <= y <= report_year + 1 for y in remaining):
+                    continue
+                parsed = _parsed_10k(edgar, cik, filing["accessionNumber"])
+                searched += 1
+                if "error" in parsed:
+                    continue
+                for year, value in analysis.annual_buyback_from_xbrl(parsed).items():
+                    if year in remaining:
+                        found[year] = value
+                        remaining.discard(year)
+            for r in rows:
+                if r["티커"] == ticker and int(r["연도"]) in found:
+                    shares, source = found[int(r["연도"])]
+                    # 회사가 단위를 잘못 적은 값 거르기: 평균 매입가가 $0.10~$10,000 밖이면 채우지 않음
+                    if not BUYBACK_PRICE_RANGE[0] <= analysis._num(r["자사주매입"]) / shares <= BUYBACK_PRICE_RANGE[1]:
+                        rejected += 1
+                        continue
+                    r["자사주매입주식수"], r["자사주매입주식수_출처"] = shares, source
+                    filled += 1
+            if i % 50 == 0:
+                print(f"{path.stem}: {i}/{len(gaps)}개 회사, 10-K {searched}건 확인, {filled}칸 채움", flush=True)
+
+        # 전년 대비 증가율 다시 계산
+        prev = {}
+        for r in sorted(rows, key=lambda r: (r["티커"], int(r["연도"]))):
+            p = prev.get((r["티커"], int(r["연도"]) - 1))
+            r["자사주매입주식수_전년대비(%)"] = analysis._growth(analysis._num(r["자사주매입주식수"]),
+                                                       analysis._num(p and p["자사주매입주식수"]))
+            prev[(r["티커"], int(r["연도"]))] = r
+        fields = [k for k in rows[0] if k != "자사주매입주식수_출처"] if rows else []
+        if fields:
+            fields.insert(fields.index("자사주매입주식수") + 1, "자사주매입주식수_출처")
+        save_csv(f"analysis/edgar/{path.name}", rows, fields)
+        print(f"{path.stem}: 빈칸 {sum(len(y) for y in gaps.values())}칸 중 {filled}칸 채움, "
+              f"평균 매입가 이상으로 제외 {rejected}칸 (10-K {searched}건 확인)", flush=True)
 
 
 def detect_splits() -> None:
@@ -278,6 +371,9 @@ def main(argv: list[str]) -> None:
 
     elif cmd == "detect-splits":
         detect_splits()
+
+    elif cmd == "fill-edgar-buyback":
+        fill_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
 
     elif cmd == "screen-dart":
         screen_dart(args)

@@ -10,6 +10,7 @@ DART와 EDGAR 데이터를 같은 형태로 맞춘 뒤 분기표와 연간표를
 """
 import hashlib
 import json
+import re
 from datetime import date
 from pathlib import Path
 
@@ -546,3 +547,133 @@ def screen_net_net(annual_rows: list[dict], year: int, market: dict[str, dict], 
         del stages["자사주매입증가"]
     passed.sort(key=lambda x: x["시총÷순유동자산"])
     return passed, stages
+
+
+# ---------------------------------------------------------------- EDGAR XBRL 원문 (자사주매입 주식수 보충)
+
+XBRLI = "{http://www.xbrl.org/2003/instance}"
+XBRLDI = "{http://xbrl.org/2006/xbrldi}"
+EQUITY_AXES = {"StatementEquityComponentsAxis", "StatementClassOfStockAxis"}
+PROGRAM_AXIS = "ShareRepurchaseProgramAxis"
+# 회사 자체 항목 이름 규칙: 매입·취득 + Shares, 누적·잔여·한도·평균가·세금 원천징수 등은 제외
+CUSTOM_BUYBACK = re.compile(r"(Repurchas|Buyback|BuyBack|TreasuryStock.*Acquired|SharesAcquired|SharesPurchased)")
+CUSTOM_EXCLUDE = re.compile(r"(Cumulative|Remaining|Authoriz|Available|Average|Price|Value|Amount|Cost|"
+                            r"Withh|Tax|Vest|Forfeit|Award|Option|Percent|Number.*Program|Since|ToDate|"
+                            r"Employee|Preferred|TemporaryEquity)")
+
+
+def _xbrl_name(tag):
+    namespace, _, local = tag[1:].partition("}")
+    return ("us-gaap" if "fasb.org/us-gaap" in namespace else "custom"), local
+
+
+def xbrl_buyback_facts(xml_bytes: bytes) -> dict:
+    """XBRL 인스턴스에서 자사주매입 주식수 후보를 기간별로 뽑는다.
+
+    companyfacts API에는 차원(열 구분)이 없는 표준 항목만 있어서, 자본변동표의 '자기주식' 열처럼
+    차원이 붙은 값이나 회사 자체 항목은 빠진다. 여기서는 그런 값까지 모은다.
+    반환: {"fy": 회계연도, "period_end": 보고기간 종료일, "facts": [{start, end, tier, rank, tag, dims, val}]}
+      tier 0 차원 없음 / 1 자본변동표 열(자본 구성요소·주식 종류) / 2 매입 프로그램별
+      rank 0~2 표준 항목(EDGAR_TAGS 순서) / 3 회사 자체 항목
+    """
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_bytes)
+
+    contexts = {}
+    for c in root.iter(f"{XBRLI}context"):
+        period = c.find(f"{XBRLI}period")
+        start, end = period.findtext(f"{XBRLI}startDate"), period.findtext(f"{XBRLI}endDate")
+        dims = {m.get("dimension").split(":")[-1]: (m.text or "").strip().split(":")[-1]
+                for m in c.iter(f"{XBRLDI}explicitMember")}
+        typed = any(True for _ in c.iter(f"{XBRLDI}typedMember"))
+        contexts[c.get("id")] = (start and start.strip(), end and end.strip(), dims, typed)
+
+    fy = period_end = None
+    facts = []
+    standard = EDGAR_TAGS["buyback_shares"]
+    for el in root:
+        if not isinstance(el.tag, str) or not el.tag.startswith("{"):
+            continue
+        source, local = _xbrl_name(el.tag)
+        if local == "DocumentFiscalYearFocus":
+            fy = int(el.text.strip()[:4])
+        elif local == "DocumentPeriodEndDate":
+            period_end = el.text.strip()[:10]
+        if "shares" not in (el.get("unitRef") or "").lower() or el.text is None:
+            continue
+        if source == "us-gaap" and local in standard:
+            rank = standard.index(local)
+        elif source == "custom" and CUSTOM_BUYBACK.search(local) and not CUSTOM_EXCLUDE.search(local):
+            rank = 3
+        else:
+            continue
+        start, end, dims, typed = contexts.get(el.get("contextRef"), (None, None, {}, True))
+        if not start or typed:
+            continue
+        if not dims:
+            tier = 0
+        elif set(dims) <= EQUITY_AXES:
+            tier = 1
+        elif set(dims) == {PROGRAM_AXIS} and rank < 3:
+            tier = 2
+        else:
+            continue
+        try:
+            val = abs(float(el.text.strip()))
+        except ValueError:
+            continue
+        facts.append({"start": start, "end": end, "tier": tier, "rank": rank,
+                      "tag": local, "dims": dims, "val": val})
+    return {"fy": fy, "period_end": period_end, "facts": facts}
+
+
+def pick_buyback_shares(facts: list[dict], start: str, end: str):
+    """한 기간의 자사주매입 주식수 하나를 고른다. 반환: (값, 출처 설명) 또는 (None, None)
+
+    차원 없음 → 자본변동표 열 → 매입 프로그램 순, 같은 단계에서는 표준 항목 우선.
+    자본변동표는 같은 주식수를 여러 열(보통주, 자기주식 등)에 적으므로 열끼리는 최댓값,
+    주식 종류(Class A/C 등)별로 나뉘어 있으면 종류끼리 합산. 매입 프로그램별 값은 합산.
+    """
+    # 캐시에 저장된 후보에도 최신 제외 규칙을 적용
+    period = [f for f in facts if f["start"] == start and f["end"] == end
+              and (f["rank"] < 3 or not CUSTOM_EXCLUDE.search(f["tag"]))]
+    if not period:
+        return None, None
+    tier, rank = min((f["tier"], f["rank"]) for f in period)
+    chosen = [f for f in period if f["tier"] == tier and f["rank"] == rank]
+    tag = chosen[0]["tag"]
+    if tier == 0:
+        value = chosen[0]["val"]
+    elif tier == 1:
+        by_class = {}
+        for f in chosen:
+            cls = f["dims"].get("StatementClassOfStockAxis")
+            by_class[cls] = max(by_class.get(cls, 0), f["val"])
+        value = by_class[None] if None in by_class else sum(by_class.values())
+    else:
+        value = sum({f["dims"][PROGRAM_AXIS]: f["val"] for f in chosen}.values())
+    if value == 0:  # 매입 금액이 있는데 0주는 다른 항목(우선주 등)일 가능성 → 못 찾은 것으로
+        return None, None
+    label = ["차원없음", "자본변동표", "매입프로그램합"][tier]
+    return int(value), f"XBRL {tag} ({label})"
+
+
+def annual_buyback_from_xbrl(parsed: dict) -> dict:
+    """10-K 한 건에서 회계연도별(보통 3개년) 자사주매입 주식수. 반환: {회계연도: (값, 출처)}
+
+    1년짜리 기간(350~380일)만 쓰고, 보고기간 종료일과의 차이(년)로 회계연도를 매긴다.
+    """
+    if not parsed["fy"] or not parsed["period_end"]:
+        return {}
+    doc_end = date.fromisoformat(parsed["period_end"])
+    out = {}
+    for start, end in {(f["start"], f["end"]) for f in parsed["facts"]}:
+        if not 350 <= _days({"start": start, "end": end}) <= 380:
+            continue
+        years_back = round((doc_end - date.fromisoformat(end)).days / 365.25)
+        if years_back < 0 or abs((doc_end - date.fromisoformat(end)).days - years_back * 365.25) > 20:
+            continue
+        value, source = pick_buyback_shares(parsed["facts"], start, end)
+        if value is not None:
+            out[parsed["fy"] - years_back] = (value, source)
+    return out
