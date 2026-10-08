@@ -20,7 +20,7 @@
 |---|---|---|---|
 | [OpenDART](https://opendart.fss.or.kr) | 한국 상장사 재무제표, 주식수, 자기주식 | API 키 | 하루 20,000건 |
 | [KRX Open API](https://openapi.krx.co.kr) | 코스피·코스닥·코넥스 일별 종가, 시가총액, 상장주식수 | API 키 (서비스별 이용 신청) | 서비스별 |
-| [SEC EDGAR](https://www.sec.gov/os/accessing-edgar-data) | 미국 상장사 XBRL 재무 데이터(companyfacts) | User-Agent(이름·이메일) | 초당 10회 |
+| [SEC EDGAR](https://www.sec.gov/os/accessing-edgar-data) | 미국 상장사 XBRL 재무 데이터(companyfacts), 10-K XBRL 원문 | User-Agent(이름·이메일) | 초당 10회 |
 
 ## 설치
 
@@ -141,14 +141,15 @@ python main.py edgar-facts AAPL                          # XBRL 재무 데이터
 
 ```
 main.py              실행 명령
-analysis.py          출처별 데이터를 같은 형태로 맞추고 분기·연간 지표표 생성
+analysis.py          출처별 데이터를 같은 형태로 맞추고 분기·연간 지표표 생성,
+                     넷넷 스크리너, 주식분할 탐지, XBRL 원문에서 자사주매입 주식수 읽기
 collectors/
   dart.py            OpenDART (재무제표, 다중회사 주요계정, 주식총수, 자기주식)
-  edgar.py           SEC EDGAR (티커, 공시 목록, companyfacts)
-  krx.py             KRX Open API (일별매매정보, 분기말 상장주식수)
+  edgar.py           SEC EDGAR (티커, 공시 목록, companyfacts, 공시별 XBRL 원문)
+  krx.py             KRX Open API (일별 종가·시가총액·상장주식수, 보통주+우선주 합산)
 TODO.md              남은 작업
 ```
 
 ## 남은 작업
 
-[TODO.md](TODO.md) 참고. 다음 우선순위는 KRX 종가를 붙여 **주가가 주당순유동자산보다 싼 종목을 걸러내는 스크리너**입니다.
+[TODO.md](TODO.md) 참고. 한국 스크리너는 완성됐고, 다음 우선순위는 **2026년 상반기 재무제표 수집**과 **미국 주가 출처를 정해 같은 스크리너 적용**입니다.
