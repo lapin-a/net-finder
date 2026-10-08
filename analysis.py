@@ -105,17 +105,26 @@ def _dart_find(rows, sj_divs, account_ids, name_test=None):
 
 
 def _dart_buyback_amount(fs_rows) -> int:
-    """현금흐름표의 자기주식 취득 금액 (보고서 기준 연초부터 누적, 양수)."""
-    bb = _dart_find(fs_rows, ["CF"], DART_BUYBACK_IDS, lambda nm: "자기주식" in nm and "취득" in nm)
+    """현금흐름표의 자기주식 취득 금액 (보고서 기준 연초부터 누적, 양수).
+
+    fs_rows는 별도재무제표(OFS)여야 한다. 연결 현금흐름표에는 종속회사의 자기주식 취득도 섞이고,
+    주식수(자기주식 취득·처분 현황)는 회사 자체 기준이라 서로 맞지 않는다.
+    """
+    rows = [r for r in fs_rows if "종속" not in r["account_nm"] and "비지배" not in r["account_nm"]]
+    bb = _dart_find(rows, ["CF"], DART_BUYBACK_IDS, lambda nm: "자기주식" in nm and "취득" in nm)
     return abs(_num(bb["thstrm_amount"]) or 0) if bb else 0
 
 
 def _dart_buyback_shares(treasury_rows, buyback_amount):
-    """자기주식 취득 수량 (보통주+우선주 총계, 연초부터 누적).
+    """자기주식 취득 수량 (보통주+우선주, 연초부터 누적). 직접취득 + 신탁계약에 의한 취득.
+
+    총계에서 '기타취득'(단주, 주식매수청구권 행사 등 매입이 아닌 취득)을 뺀다.
     총계 행이 없으면 미공시 → 현금흐름표상 매입 금액이 0일 때만 0주로 판단."""
     totals = [r for r in treasury_rows if r["acqs_mth1"] == "총계"]
     if totals:
-        return sum(_num(r["change_qy_acqs"]) or 0 for r in totals)
+        other = [r for r in treasury_rows if r["acqs_mth1"] == "기타취득"]
+        return (sum(_num(r["change_qy_acqs"]) or 0 for r in totals)
+                - sum(_num(r["change_qy_acqs"]) or 0 for r in other))
     return 0 if buyback_amount == 0 else None
 
 
@@ -125,8 +134,10 @@ def dart_records(client, corp_code: str, start_year: int, end_year: int):
     for year in range(start_year, end_year + 1):
         ytd = {"net_income": {}, "buyback": {}, "buyback_shares": {}}
         for reprt_code, q in DART_REPORTS:
+            fs_div = "CFS"
             rows = client.financial_statements(corp_code, str(year), reprt_code, "CFS")
             if not rows:  # 종속회사가 없으면 연결재무제표가 없음 → 별도재무제표
+                fs_div = "OFS"
                 rows = client.financial_statements(corp_code, str(year), reprt_code, "OFS")
             if not rows:
                 continue
@@ -149,7 +160,10 @@ def dart_records(client, corp_code: str, start_year: int, end_year: int):
                 ytd["net_income"][q] = cum
 
             # 현금흐름표는 분기보고서에서도 누적값 → 직전 누적값을 빼서 분기값 계산
-            bb_cum = _dart_buyback_amount(rows)
+            # 자사주매입은 회사 자체 기준(별도재무제표)으로
+            ofs_rows = rows if fs_div == "OFS" else (
+                client.financial_statements(corp_code, str(year), reprt_code, "OFS") or rows)
+            bb_cum = _dart_buyback_amount(ofs_rows)
             ytd["buyback"][q] = bb_cum
             rec["buyback"] = bb_cum if q == 1 else _sub(bb_cum, ytd["buyback"].get(q - 1))
 
@@ -241,7 +255,7 @@ def dart_multi_records(client, corp_codes: list[str], start_year: int, end_year:
 def fill_dart_annual_buyback(client, results: dict, years, progress=print) -> int:
     """사업보고서 기준 연간 자사주매입(금액·주식수)을 회사별로 받아 results에 채운다.
 
-    회사당 연도마다 2건 호출(재무제표 + 자기주식 현황). years 순서대로 전체 회사를 처리한다.
+    회사당 연도마다 2건 호출(별도재무제표 + 자기주식 현황). years 순서대로 전체 회사를 처리한다.
     DART 일일 한도(오류 020)에 걸리면 거기서 멈추고 처리한 회사 수를 돌려준다.
     """
     done = 0
@@ -249,7 +263,9 @@ def fill_dart_annual_buyback(client, results: dict, years, progress=print) -> in
         targets = [(corp, annual[year]) for corp, (_, annual) in results.items() if year in annual]
         for i, (corp, rec) in enumerate(targets, 1):
             try:
-                fs_rows = client.financial_statements(corp, str(year), "11011", rec["fs_div"])
+                # 자사주매입은 회사 자체 기준(별도재무제표). 별도가 없으면 연결로 대체
+                fs_rows = (client.financial_statements(corp, str(year), "11011", "OFS")
+                           or client.financial_statements(corp, str(year), "11011", rec["fs_div"]))
                 treasury = client.treasury_stock(corp, str(year), "11011")
             except RuntimeError as e:
                 if "020" in str(e):

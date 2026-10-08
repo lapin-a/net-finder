@@ -3,6 +3,7 @@
 인증키 발급: https://openapi.krx.co.kr (서비스별 이용 신청 필요)
 """
 import json
+import re
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import requests
 
 BASE_URL = "https://data-dbg.krx.co.kr/svc/apis/sto"
+PREFERRED_NAME = re.compile(r"\d?우[A-Z]?(\(전환\))?$")
 MARKETS = {"KOSPI": "stk_bydd_trd", "KOSDAQ": "ksq_bydd_trd", "KONEX": "knx_bydd_trd"}
 
 
@@ -60,7 +62,8 @@ class KrxClient:
         """전 시장 종목코드 → {종가, 시가총액, 상장주식수}. 시가총액·주식수는 보통주 + 해당 우선주 합계.
 
         우선주는 종목코드 앞 5자리가 같고 이름이 보통주 이름으로 시작하면 보통주에 합산한다.
-        (예: 005930 삼성전자 + 005935 삼성전자우). 종가는 보통주 종가.
+        (예: 005930 삼성전자 + 005935 삼성전자우). 이름이 줄여 쓰였어도 앞 5자리가 같은 보통주가
+        하나뿐이고 이름이 '우', '2우B' 등으로 끝나면 합산한다. 종가는 보통주 종가.
         """
         bas_dd, kospi = self.last_trading_day(on_or_before)
         rows = kospi + self.daily("KOSDAQ", bas_dd) + self.daily("KONEX", bas_dd)
@@ -73,8 +76,10 @@ class KrxClient:
         for r in rows:
             if r["ISU_CD"] in commons:
                 continue
-            common = next((c for c in commons.values()
-                           if c["ISU_CD"][:5] == r["ISU_CD"][:5] and r["ISU_NM"].startswith(c["ISU_NM"])), None)
+            same_prefix = [c for c in commons.values() if c["ISU_CD"][:5] == r["ISU_CD"][:5]]
+            common = next((c for c in same_prefix if r["ISU_NM"].startswith(c["ISU_NM"])), None)
+            if common is None and len(same_prefix) == 1 and PREFERRED_NAME.search(r["ISU_NM"]):
+                common = same_prefix[0]  # 이름이 줄여 쓰인 우선주 (예: 남선알미늄 → 남선알미우)
             if common:
                 data[common["ISU_CD"]]["mktcap"] += int(r["MKTCAP"])
                 data[common["ISU_CD"]]["shares"] += int(r["LIST_SHRS"])
