@@ -652,7 +652,7 @@ def pick_buyback_shares(facts: list[dict], start: str, end: str):
         value = by_class[None] if None in by_class else sum(by_class.values())
     else:
         value = sum({f["dims"][PROGRAM_AXIS]: f["val"] for f in chosen}.values())
-    if value == 0:  # 매입 금액이 있는데 0주는 다른 항목(우선주 등)일 가능성 → 못 찾은 것으로
+    if int(value) == 0:  # 매입 금액이 있는데 0주(1주 미만 포함)는 다른 항목일 가능성 → 못 찾은 것으로
         return None, None
     label = ["차원없음", "자본변동표", "매입프로그램합"][tier]
     return int(value), f"XBRL {tag} ({label})"

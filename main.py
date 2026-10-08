@@ -28,6 +28,7 @@ import csv
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
@@ -148,11 +149,35 @@ def _parsed_10k(edgar: EdgarClient, cik: str, accn: str) -> dict:
     return parsed
 
 
-def fill_edgar_buyback(edgar: EdgarClient, letters: list[str]) -> None:
+def _search_10k_buyback(edgar: EdgarClient, cik: str, years: set[int]) -> tuple[dict, int]:
+    """한 회사의 빈 연도들을 최신 10-K부터 거꾸로 찾는다. 반환: ({연도: (주식수, 출처)}, 확인한 10-K 수)"""
+    found, remaining, searched = {}, set(years), 0
+    tenks = sorted(edgar.filings(cik, ("10-K",), include_older=True), key=lambda x: x["reportDate"], reverse=True)
+    for filing in tenks:
+        if not remaining or not filing["reportDate"]:
+            break
+        report_year = int(filing["reportDate"][:4])
+        if report_year < min(remaining) - 1:
+            break
+        if not any(report_year - 3 <= y <= report_year + 1 for y in remaining):
+            continue
+        parsed = _parsed_10k(edgar, cik, filing["accessionNumber"])
+        searched += 1
+        if "error" in parsed:
+            continue
+        for year, value in analysis.annual_buyback_from_xbrl(parsed).items():
+            if year in remaining:
+                found[year] = value
+                remaining.discard(year)
+    return found, searched
+
+
+def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6) -> None:
     """EDGAR 일괄 연간표에서 자사주매입 금액은 있는데 주식수가 빈 칸을 10-K XBRL 원문으로 채운다.
 
     10-K 자본변동표에는 3개년이 들어 있으므로 최신 10-K부터 거꾸로 내려가며, 빈 연도가 다 채워지거나
     더 볼 10-K가 없으면 멈춘다. 결과는 원래 파일에 덮어쓰고 '자사주매입주식수_출처' 열을 붙인다.
+    회사 workers개를 동시에 처리하되, 요청 간격은 EdgarClient가 스레드 전체를 합쳐 지킨다.
     """
     ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
     paths = sorted((DATA_DIR / "analysis/edgar").glob("batch_*_연간.csv"))
@@ -171,41 +196,23 @@ def fill_edgar_buyback(edgar: EdgarClient, letters: list[str]) -> None:
                 gaps.setdefault(r["티커"], set()).add(int(r["연도"]))
 
         filled = searched = rejected = 0
-        for i, (ticker, years) in enumerate(gaps.items(), 1):
-            cik = ciks.get(ticker)
-            if not cik:
-                continue
-            found = {}
-            remaining = set(years)
-            tenks = sorted(edgar.filings(cik, ("10-K",), include_older=True),
-                           key=lambda x: x["reportDate"], reverse=True)
-            for filing in tenks:
-                if not remaining or not filing["reportDate"]:
-                    break
-                report_year = int(filing["reportDate"][:4])
-                if report_year < min(remaining) - 1:
-                    break
-                if not any(report_year - 3 <= y <= report_year + 1 for y in remaining):
-                    continue
-                parsed = _parsed_10k(edgar, cik, filing["accessionNumber"])
-                searched += 1
-                if "error" in parsed:
-                    continue
-                for year, value in analysis.annual_buyback_from_xbrl(parsed).items():
-                    if year in remaining:
-                        found[year] = value
-                        remaining.discard(year)
-            for r in rows:
-                if r["티커"] == ticker and int(r["연도"]) in found:
-                    shares, source = found[int(r["연도"])]
-                    # 회사가 단위를 잘못 적은 값 거르기: 평균 매입가가 $0.10~$10,000 밖이면 채우지 않음
-                    if not BUYBACK_PRICE_RANGE[0] <= analysis._num(r["자사주매입"]) / shares <= BUYBACK_PRICE_RANGE[1]:
-                        rejected += 1
-                        continue
-                    r["자사주매입주식수"], r["자사주매입주식수_출처"] = shares, source
-                    filled += 1
-            if i % 50 == 0:
-                print(f"{path.stem}: {i}/{len(gaps)}개 회사, 10-K {searched}건 확인, {filled}칸 채움", flush=True)
+        jobs = [(ticker, ciks[ticker], years) for ticker, years in gaps.items() if ticker in ciks]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_search_10k_buyback, edgar, cik, years) for _, cik, years in jobs]
+            for i, ((ticker, _, _), future) in enumerate(zip(jobs, futures), 1):
+                found, n = future.result()
+                searched += n
+                for r in rows:
+                    if r["티커"] == ticker and int(r["연도"]) in found:
+                        shares, source = found[int(r["연도"])]
+                        # 회사가 단위를 잘못 적은 값 거르기: 평균 매입가가 $0.10~$10,000 밖이면 채우지 않음
+                        if not BUYBACK_PRICE_RANGE[0] <= analysis._num(r["자사주매입"]) / shares <= BUYBACK_PRICE_RANGE[1]:
+                            rejected += 1
+                            continue
+                        r["자사주매입주식수"], r["자사주매입주식수_출처"] = shares, source
+                        filled += 1
+                if i % 50 == 0:
+                    print(f"{path.stem}: {i}/{len(jobs)}개 회사, 10-K {searched}건 확인, {filled}칸 채움", flush=True)
 
         # 전년 대비 증가율 다시 계산
         prev = {}

@@ -4,6 +4,7 @@ API 키는 필요 없지만 User-Agent에 이름과 이메일을 반드시 넣�
 초당 10회 이하로 요청해야 합니다. https://www.sec.gov/os/accessing-edgar-data
 """
 import re
+import threading
 import time
 
 import requests
@@ -15,15 +16,36 @@ LINKBASE_FILE = re.compile(r"(_(cal|def|lab|pre)\.xml|FilingSummary\.xml)$", re.
 
 
 class EdgarClient:
-    def __init__(self, user_agent: str, delay: float = 0.15):
+    """여러 스레드에서 같이 써도 된다. 요청 간격(delay)은 스레드 전체를 합쳐서 지킨다 (SEC 한도: 초당 10회)."""
+
+    def __init__(self, user_agent: str, delay: float = 0.12):
         if not user_agent:
             raise ValueError("EDGAR_USER_AGENT가 설정되지 않았습니다. 예: 'Your Name you@example.com'")
+        self.user_agent = user_agent
         self.delay = delay
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"})
+        self._local = threading.local()  # requests.Session은 스레드마다 따로
+        self._lock = threading.Lock()
+        self._next_time = 0.0
+
+    @property
+    def session(self) -> requests.Session:
+        if not hasattr(self._local, "session"):
+            self._local.session = requests.Session()
+            self._local.session.headers.update({"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate"})
+        return self._local.session
+
+    def _wait_turn(self) -> None:
+        """다음 요청 시각을 예약하고 그때까지 기다린다."""
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_time)
+            self._next_time = start + self.delay
+        if start > now:
+            time.sleep(start - now)
 
     def _get(self, url: str, timeout: int = 30) -> requests.Response:
         for attempt in range(5):
+            self._wait_turn()
             try:
                 resp = self.session.get(url, timeout=timeout)
                 if resp.status_code in (429, 503):  # 요청 과다 → 잠시 쉬고 재시도
@@ -34,7 +56,6 @@ class EdgarClient:
                 if attempt == 4:
                     raise
                 time.sleep(2 ** (attempt + 1))
-        time.sleep(self.delay)
         return resp
 
     def _get_json(self, url: str) -> dict:
