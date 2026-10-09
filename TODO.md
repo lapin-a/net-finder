@@ -49,7 +49,7 @@
 ## 4. 정리
 
 - [x] 전체 검증 (2026-10-08): 계산식 재계산 불일치 0건, 삼성전자·애플 공시와 일치. 자사주매입 집계 버그 등 4건 수정 (`e31b4e0`)
-- [ ] 로컬 폴더 이름 `new-folder` → `net-finder` (Claude Code 세션 종료 후)
+- [x] 로컬 폴더 이름 `new-folder` → `net-finder` (2026-10-09, `codyssey/net-finder`)
   - OneDrive 밖으로 옮기는 것도 검토 (`data/cache` 2GB 넘음, 동기화 부담)
 - [ ] 주식분할 보정: 분할 전 연도의 발행주식수·주당 지표를 분할 비율로 조정 (예: 삼성전자 2018년 50:1, 애플 2020년 4:1)
   - [x] 후보 탐지 `detect-splits` → `data/analysis/splits_{dart,edgar}.csv` (한국 1,090건, 미국 3,895건)
