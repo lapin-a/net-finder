@@ -11,7 +11,7 @@ DART와 EDGAR 데이터를 같은 형태로 맞춘 뒤 분기표와 연간표를
 import hashlib
 import json
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 BALANCE_KEYS = ("current_assets", "total_liabilities", "shares")
@@ -325,10 +325,12 @@ def _days(e):
 
 def edgar_periods(facts: dict) -> dict:
     """각 공시(accn)의 보고 기간 종료일과 회계연도·분기. 반환: {accn: (종료일, 회계연도, 분기)}"""
-    period_of_accn = {}
+    period_of_accn, annual_report = {}, set()
     for e in _edgar_entries(facts, "us-gaap", ["AssetsCurrent", "Assets"], "USD"):
         if e.get("fp") in FP_TO_Q and e["end"] > period_of_accn.get(e["accn"], ("",))[0]:
             period_of_accn[e["accn"]] = (e["end"], e["fy"], FP_TO_Q[e["fp"]])
+            if e["form"].startswith("10-K"):
+                annual_report.add(e["accn"])
     # 회사가 회계연도를 잘못 적은 공시(PRTH 43830 = 엑셀 날짜 일련번호, WTBA 2107 등)는
     # 같은 회사의 다른 공시에서 흔한 '회계연도 − 종료일 연도' 차이로 다시 계산
     offsets = [fy - int(end[:4]) for end, fy, _ in period_of_accn.values() if fy and abs(fy - int(end[:4])) <= 1]
@@ -336,7 +338,73 @@ def edgar_periods(facts: dict) -> dict:
     for accn, (end, fy, q) in period_of_accn.items():
         if not fy or abs(fy - int(end[:4])) > 1:
             period_of_accn[accn] = (end, int(end[:4]) + offset, q)
-    return period_of_accn
+    return _fix_period_collisions(period_of_accn, annual_report)
+
+
+def _collided(period_of_accn: dict) -> set:
+    """종료일이 다른 공시와 같은 (회계연도, 분기)를 쓰는 공시들."""
+    ends = {}
+    for end, fy, q in period_of_accn.values():
+        ends.setdefault((fy, q), set()).add(end)
+    return {accn for accn, (_, fy, q) in period_of_accn.items() if len(ends[(fy, q)]) > 1}
+
+
+def _fy_label_year(d: date) -> int:
+    """회계연도 종료일이 속한 해. 1월 초에 끝나는 52·53주 회계연도는 앞 해로 본다."""
+    return (d - timedelta(days=7)).year
+
+
+def _add_years(d: date, years: int) -> date:
+    try:
+        return d.replace(year=d.year + years)
+    except ValueError:  # 2월 29일
+        return d.replace(year=d.year + years, day=28)
+
+
+def _fix_period_collisions(period_of_accn: dict, annual_report: set) -> dict:
+    """같은 (회계연도, 분기)에 종료일이 다른 공시가 겹치면 겹친 공시만 종료일로 다시 계산한다.
+
+    회사가 표지에 회계연도·분기를 잘못 적은 경우가 많다 (ACN은 2018-11-30·2019-11-30 분기를 둘 다 2019 Q1,
+    AES는 세 분기를 모두 2022 Q2). 겹치지 않은 공시는 회사 표기를 그대로 둔다 (10-K 원문 연도와 맞추기 위해).
+    분기: 10-K 종료일(회계연도 끝)들 사이에서 몇 번째 3개월인지. 회계연도: 가장 가까운 정상 10-K의 표기 ± 연도 차이.
+    다시 계산한 값이 정상 공시와 또 겹치거나(결산월 변경, 회사의 회계연도 표기 방식 변경 등) 분기를 정할 수 없으면 원래 값을 둔다.
+    """
+    bad = _collided(period_of_accn)
+    anchors = sorted({date.fromisoformat(period_of_accn[a][0]) for a in annual_report})
+    if not bad or not anchors:
+        return period_of_accn
+    # 같은 종료일 10-K가 여럿이면 나중에 낸 공시(접수번호가 큰 쪽) 표기를 쓴다
+    label = {date.fromisoformat(period_of_accn[a][0]): period_of_accn[a][1] for a in sorted(annual_report) if a not in bad}
+    tolerance = timedelta(days=7)  # 52·53주 회계연도
+    out = dict(period_of_accn)
+    for accn in bad:
+        end, fy, q = period_of_accn[accn]
+        e = date.fromisoformat(end)
+        fy_end = next((d for d in anchors if d >= e - tolerance), None)
+        if fy_end is None:  # 마지막 10-K 이후 분기
+            k = 1
+            while _add_years(anchors[-1], k) < e - tolerance:
+                k += 1
+            fy_end = _add_years(anchors[-1], k)
+        fy_start = max((d for d in anchors if d < fy_end - timedelta(days=300)), default=None)
+        if fy_start is None or (fy_end - fy_start).days > 380:  # 10-K가 빠진 해
+            fy_start = _add_years(fy_end, -1)
+        new_q = 4 if abs((fy_end - e).days) <= 7 else round((e - fy_start).days / 91.3)
+        if not 1 <= new_q <= 4:
+            continue
+        if label:
+            near = min(label, key=lambda d: (abs((d - fy_end).days), -d.toordinal()))  # 같은 거리면 나중 10-K
+            new_fy = label[near] + round((fy_end - near).days / 365.25)
+        else:
+            offsets = [period_of_accn[a][1] - _fy_label_year(date.fromisoformat(period_of_accn[a][0])) for a in annual_report]
+            new_fy = _fy_label_year(fy_end) + max(sorted(set(offsets)), key=offsets.count)
+        out[accn] = (end, new_fy, new_q)
+    taken = {(fy, q): end for accn, (end, fy, q) in period_of_accn.items() if accn not in bad}
+    for accn in bad:
+        end, fy, q = out[accn]
+        if taken.get((fy, q), end) != end:
+            out[accn] = period_of_accn[accn]
+    return out
 
 
 def edgar_records(facts: dict):
@@ -713,13 +781,14 @@ def pick_buyback_shares(facts: list[dict], start: str, end: str):
     return int(value), f"XBRL {tag} ({label})"
 
 
-def annual_buyback_from_xbrl(parsed: dict) -> dict:
+def annual_buyback_from_xbrl(parsed: dict, fy: int | None = None) -> dict:
     """10-K 한 건에서 회계연도별(보통 3개년) 자사주매입 주식수. 반환: {회계연도: (값, 출처)}
 
     1년짜리 기간(350~380일)만 쓰고, 보고기간 종료일과의 차이(년)로 회계연도를 매긴다.
+    fy: 이 10-K의 회계연도 (분기표와 맞추려고 edgar_periods 값을 넘김). 없으면 원문 표지 값.
     """
-    fy = _doc_fy(parsed)
-    if not fy:
+    fy = fy or _doc_fy(parsed)
+    if not fy or not parsed.get("period_end"):
         return {}
     doc_end = date.fromisoformat(parsed["period_end"])
     out = {}
@@ -781,14 +850,15 @@ def _years_back(doc_end: date, end: str):
     return years_back if years_back >= 0 and abs(days - years_back * 365.25) <= 20 else None
 
 
-def treasury_increase_from_xbrl(parsed: dict) -> dict:
+def treasury_increase_from_xbrl(parsed: dict, fy: int | None = None) -> dict:
     """10-K 한 건의 자기주식 잔액(기말 − 기초)이 늘어난 회계연도별 증가 주식수. 반환: {회계연도: (값, 출처)}
 
     매입량의 추정치: 그 해에 소각하거나 직원 보상으로 다시 내준 주식이 있으면 실제 매입보다 작게 나온다.
     잔액이 줄었거나 그대로면 추정하지 않는다. 같은 항목으로 기초·기말이 다 있어야 한다.
+    fy: annual_buyback_from_xbrl와 같음.
     """
-    fy = _doc_fy(parsed)
-    if not fy or not parsed.get("treasury"):
+    fy = fy or _doc_fy(parsed)
+    if not fy or not parsed.get("treasury") or not parsed.get("period_end"):
         return {}
     doc_end = date.fromisoformat(parsed["period_end"])
     for tag in TREASURY_BALANCE_TAGS:

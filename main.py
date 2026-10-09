@@ -166,6 +166,7 @@ def _search_10k_buyback(edgar: EdgarClient, cik: str, years: set[int], estimate:
     estimate면 매입 주식수 항목을 끝내 못 찾은 연도를 자기주식 잔액 증가분(추정)으로 채운다.
     """
     found, estimated, remaining, searched = {}, {}, set(years), 0
+    periods = analysis.edgar_periods(edgar.company_facts(cik))  # 회계연도를 분기·연간표와 같은 기준으로
     tenks = sorted(edgar.filings(cik, ("10-K",), include_older=True), key=lambda x: x["reportDate"], reverse=True)
     for filing in tenks:
         if not remaining or not filing["reportDate"]:
@@ -179,11 +180,12 @@ def _search_10k_buyback(edgar: EdgarClient, cik: str, years: set[int], estimate:
         searched += 1
         if "error" in parsed:
             continue
-        for year, value in analysis.annual_buyback_from_xbrl(parsed).items():
+        fy = periods.get(filing["accessionNumber"], (None, None))[1]
+        for year, value in analysis.annual_buyback_from_xbrl(parsed, fy).items():
             if year in remaining:
                 found[year] = value
                 remaining.discard(year)
-        for year, value in analysis.treasury_increase_from_xbrl(parsed).items():
+        for year, value in analysis.treasury_increase_from_xbrl(parsed, fy).items():
             estimated.setdefault(year, value)  # 최신 10-K 값 우선
     if not estimate:
         return found, searched
@@ -215,27 +217,37 @@ def _letter_paths(kind: str) -> list[Path]:
             if len(p.stem.split("_")[1]) == 1]
 
 
-def refresh_edgar_tickers(edgar: EdgarClient, tickers: list[str]) -> None:
+def refresh_edgar_tickers(edgar: EdgarClient, tickers: list[str], workers: int = 6) -> None:
     """일부 회사만 companyfacts를 다시 받아 글자별 일괄 결과(연간·분기)의 해당 행을 바꾼다.
 
     분석 코드를 고친 뒤 일부 회사만 다시 계산할 때 사용. 연간표의 XBRL 보충값은 지워지므로 fill-edgar-buyback을 다시 실행.
     """
     ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
+    by_letter = {}
     for ticker in (t.upper() for t in tickers):
+        by_letter.setdefault(ticker[0], []).append(ticker)
+
+    def tables(ticker):
         quarters, annual = analysis.edgar_records(edgar.company_facts(ciks[ticker]))
-        for kind, new in (("분기", analysis.quarterly_table(quarters)), ("연간", analysis.annual_table(annual))):
-            path = DATA_DIR / f"analysis/edgar/batch_{ticker[0]}_{kind}.csv"
+        return {"분기": analysis.quarterly_table(quarters), "연간": analysis.annual_table(annual)}
+
+    for letter, group in sorted(by_letter.items()):
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            computed = dict(zip(group, pool.map(tables, group)))
+        for kind in ("분기", "연간"):
+            path = DATA_DIR / f"analysis/edgar/batch_{letter}_{kind}.csv"
             rows = _load_csv(path)
-            at = next((i for i, r in enumerate(rows) if r["티커"] == ticker), None)
-            if at is None:
-                print(f"{ticker}: {path.name}에 없음")
-                continue
-            head = {"티커": ticker, "회사명": rows[at]["회사명"]}
-            new = [{**head, **row} for row in new]
-            if kind == "연간":
-                for r in new:
-                    r["자사주매입주식수_출처"] = "companyfacts" if r["자사주매입주식수"] not in ("", None) else ""
-            rows = rows[:at] + new + [r for r in rows[at:] if r["티커"] != ticker]
+            for ticker in group:
+                at = next((i for i, r in enumerate(rows) if r["티커"] == ticker), None)
+                if at is None:
+                    print(f"{ticker}: {path.name}에 없음")
+                    continue
+                head = {"티커": ticker, "회사명": rows[at]["회사명"]}
+                new = [{**head, **row} for row in computed[ticker][kind]]
+                if kind == "연간":
+                    for r in new:
+                        r["자사주매입주식수_출처"] = "companyfacts" if r["자사주매입주식수"] not in ("", None) else ""
+                rows = rows[:at] + new + [r for r in rows[at:] if r["티커"] != ticker]
             if kind == "연간":
                 _save_edgar_annual(path, rows)
             else:
