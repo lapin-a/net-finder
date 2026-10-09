@@ -35,6 +35,8 @@ import math
 import os
 import statistics
 import sys
+import zipfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
@@ -573,38 +575,60 @@ def detect_splits() -> None:
 
 def screen_dart(args: list[str]) -> None:
     """넷넷 스크리너. 옵션:
-    [연도]               기본: 연간 일괄 결과의 최신 연도
+    [연도|분기]          기본: 연간 일괄 결과의 최신 연도. 2026Q2처럼 쓰면 분기 결과로 (순이익은 최근 4분기 합)
+    --quarterly          분기 결과의 최신 분기로
     --ratio R            시가총액 ÷ (유동자산 - 총부채) 상한 (기본 0.667 = 그레이엄 2/3)
     --profit A,B         허용할 순이익 상태 (기본 흑자,흑자전환)
     --profit-years N     순이익 상태를 볼 기간 3/5/10 (기본 3)
     --no-buyback         자사주매입 주식수 전년 대비 증가 조건 끄기
-    --price-date YYYYMMDD  주가 기준일 (기본: 해당 연도 12월 31일, 휴장이면 직전 거래일)
+                         (분기 기준일 때는 그 분기 이전 최신 연간 자사주매입으로 판단)
+    --price-date YYYYMMDD  주가 기준일 (기본: 해당 연도·분기 말일, 휴장이면 직전 거래일)
     """
     def opt(name, default):
         return args[args.index(name) + 1] if name in args else default
 
-    path = DATA_DIR / "analysis/dart/batch_상장사_연간.csv"
-    if not path.exists():
-        sys.exit(f"{path} 가 없습니다 → 먼저 analyze-dart-batch 를 실행하세요")
-    with path.open(encoding="utf-8-sig") as f:
-        rows = list(csv.DictReader(f))
+    def load(kind):
+        path = DATA_DIR / f"analysis/dart/batch_상장사_{kind}.csv"
+        if not path.exists():
+            sys.exit(f"{path} 가 없습니다 → 먼저 analyze-dart-batch 를 실행하세요")
+        with path.open(encoding="utf-8-sig") as f:
+            return list(csv.DictReader(f))
 
+    def latest(rows, key):
+        """자료가 충분한(가장 많은 기간의 절반 이상) 최신 기간. 결산월이 12월이 아닌 몇십 개 회사만 있는 기간은 건너뜀."""
+        counts = Counter(r[key] for r in rows if r["주당순유동자산"])
+        return max(p for p, n in counts.items() if n >= max(counts.values()) / 2)
+
+    annual = load("연간")
     positional = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or not args[i - 1].startswith("--"))]
-    year = int(positional[0]) if positional else max(int(r["연도"]) for r in rows if r["주당순유동자산"])
+    quarterly = "--quarterly" in args or (positional and "Q" in positional[0].upper())
+    if quarterly:
+        rows = load("분기")
+        period = positional[0].upper() if positional else latest(rows, "기간")
+        year, q = int(period[:4]), int(period[-1])
+        month, day = QUARTER_ENDS[q]
+        # 분기 자사주매입은 수집하지 않으므로 그 분기보다 앞서 끝난 최신 연간 값으로 판단
+        buyback_year = max(int(r["연도"]) for r in annual if r["자사주매입주식수"] and int(r["연도"]) < year + (q == 4))
+        buyback = analysis.annual_buyback_pairs(annual, buyback_year)
+    else:
+        rows, buyback, buyback_year = annual, None, None
+        period = year = int(positional[0] if positional else latest(annual, "연도"))
+        month, day = 12, 31
     max_ratio = float(opt("--ratio", 2 / 3))
     profit_status = set(opt("--profit", "흑자,흑자전환").split(","))
     profit_years = int(opt("--profit-years", 3))
-    price_date = opt("--price-date", f"{year}1231")
+    price_date = opt("--price-date", f"{year}{month:02d}{day:02d}")
 
     krx = KrxClient(os.getenv("KRX_API_KEY", ""), cache_dir=DATA_DIR / "cache/krx")
     bas_dd, market = krx.market_data(date(int(price_date[:4]), int(price_date[4:6]), int(price_date[6:])))
-    print(f"재무 {year}년 / 주가 기준일 {bas_dd}")
+    print(f"재무 {period}{'' if quarterly else '년'} / 주가 기준일 {bas_dd}"
+          + (f" / 자사주매입 {buyback_year}년 vs {buyback_year - 1}년" if buyback_year else ""))
 
-    passed, stages = analysis.screen_net_net(rows, year, market, max_ratio, profit_years, profit_status,
-                                             buyback_up="--no-buyback" not in args)
+    passed, stages = analysis.screen_net_net(rows, period, market, max_ratio, profit_years, profit_status,
+                                             buyback_up="--no-buyback" not in args, buyback=buyback)
     for name, count in stages.items():
         print(f"  {name}: {count}")
-    save_csv(f"analysis/dart/screen_{year}_{bas_dd}.csv", passed, list(passed[0]) if passed else ["종목코드"])
+    save_csv(f"analysis/dart/screen_{period}_{bas_dd}.csv", passed, list(passed[0]) if passed else ["종목코드"])
 
 
 QUARTER_ENDS ={1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
@@ -629,9 +653,25 @@ def fill_krx_shares(results: dict, corps: dict, start: int, end: int) -> None:
         print(f"{year} KRX 상장주식수 완료", flush=True)
 
 
+def _listed_corps(dart: DartClient) -> list[dict]:
+    """종목코드가 있는 회사 목록. 받을 때마다 data/dart/listed_corps.json에 저장해 두고,
+    고유번호 API가 점검 등으로 막히면(zip 대신 오류 XML이 옴) 저장해 둔 목록을 쓴다."""
+    path = DATA_DIR / "dart/listed_corps.json"
+    try:
+        corps = [c for c in dart.corp_codes() if c["stock_code"]]
+    except zipfile.BadZipFile:
+        if not path.exists():
+            raise
+        corps = json.loads(path.read_text(encoding="utf-8"))
+        print(f"고유번호 API를 쓸 수 없어 저장해 둔 목록 사용: {path}", flush=True)
+        return corps
+    save("dart/listed_corps.json", corps)
+    return corps
+
+
 def analyze_dart_batch(dart: DartClient, start: int, end: int, buyback_years: list[int] = ()) -> None:
     """종목코드가 있는 회사 전체의 유동자산·총부채·순이익을 통합 CSV로 저장."""
-    corps = {c["corp_code"]: c for c in dart.corp_codes() if c["stock_code"]}
+    corps = {c["corp_code"]: c for c in _listed_corps(dart)}
     print(f"대상 회사: {len(corps)}", flush=True)
     results = analysis.dart_multi_records(dart, list(corps), start, end,
                                          progress=lambda msg: print(msg, flush=True),

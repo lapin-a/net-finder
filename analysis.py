@@ -184,6 +184,12 @@ def dart_records(client, corp_code: str, start_year: int, end_year: int):
     return quarters, annual
 
 
+def _dart_report_settled(year: int, q: int, today: date | None = None) -> bool:
+    """보고서 제출기한(분기·반기 45일, 사업보고서 90일)에서 30일이 지났는지. 지나기 전에는 공시가 덜 모였다고 본다."""
+    deadline = {1: date(year, 5, 15), 2: date(year, 8, 14), 3: date(year, 11, 14), 4: date(year + 1, 3, 31)}[q]
+    return ((today or date.today()) - deadline).days > 30
+
+
 def dart_multi_records(client, corp_codes: list[str], start_year: int, end_year: int,
                        progress=print, cache_dir=None):
     """다중회사 주요계정 API로 유동자산·총부채·순이익만 수집 (100개 회사씩 한 번에).
@@ -192,7 +198,7 @@ def dart_multi_records(client, corp_codes: list[str], start_year: int, end_year:
     cache_dir를 주면 응답을 파일로 저장해 두고, 다시 실행할 때 이미 받은 것은 건너뛴다.
     반환: {corp_code: (quarters, annual)}
     """
-    def fetch(chunk, year, reprt_code):
+    def fetch(chunk, year, reprt_code, q):
         if cache_dir is None:
             return client.multi_major_accounts(chunk, str(year), reprt_code)
         key = hashlib.md5(",".join(chunk).encode()).hexdigest()[:12]
@@ -200,8 +206,9 @@ def dart_multi_records(client, corp_codes: list[str], start_year: int, end_year:
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
         rows = client.multi_major_accounts(chunk, str(year), reprt_code)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+        if _dart_report_settled(year, q):  # 제출기한 전 보고서는 아직 덜 들어왔으므로 저장하지 않음
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
         return rows
 
     # raw[corp][(year, q)] = {"current_assets", "total_liabilities", "ni", "ni_ytd"}
@@ -211,7 +218,7 @@ def dart_multi_records(client, corp_codes: list[str], start_year: int, end_year:
         for reprt_code, q in DART_REPORTS:
             for chunk in chunks:
                 by_corp = {}
-                for r in fetch(chunk, year, reprt_code):
+                for r in fetch(chunk, year, reprt_code, q):
                     by_corp.setdefault(r["corp_code"], {}).setdefault(r["fs_div"], []).append(r)
                 for corp, fs in by_corp.items():
                     fs_div = "CFS" if fs.get("CFS") else "OFS"  # 연결 우선, 없으면 별도
@@ -505,24 +512,34 @@ def annual_table(annual: dict) -> list[dict]:
     return rows
 
 
-def screen_net_net(annual_rows: list[dict], year: int, market: dict[str, dict], max_ratio: float,
-                   profit_years: int, profit_status: set[str], buyback_up: bool):
-    """연간 일괄 결과에서 넷넷 종목을 거른다.
-
-    시가총액 ÷ (유동자산 - 총부채) ≤ max_ratio, 최근 profit_years년 순이익 상태가 profit_status 중 하나,
-    (buyback_up이면) 자사주매입 주식수가 전년보다 많은 종목.
-    반환: (통과 행 목록, 단계별 남은 종목 수)
-    """
+def annual_buyback_pairs(annual_rows: list[dict], year: int) -> dict:
+    """연간 결과에서 {종목코드: (year 자사주매입 주식수, 전년 주식수)}."""
     by_code = {}
     for r in annual_rows:
         by_code.setdefault(r["종목코드"], {})[int(r["연도"])] = r
+    return {code: (_num(years.get(year, {}).get("자사주매입주식수")),
+                   _num(years.get(year - 1, {}).get("자사주매입주식수")))
+            for code, years in by_code.items()}
+
+
+def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio: float,
+                   profit_years: int, profit_status: set[str], buyback_up: bool, buyback: dict | None = None):
+    """연간 또는 분기 일괄 결과에서 넷넷 종목을 거른다.
+
+    시가총액 ÷ (유동자산 - 총부채) ≤ max_ratio, 최근 profit_years년 순이익 상태가 profit_status 중 하나,
+    (buyback_up이면) 자사주매입 주식수가 전년보다 많은 종목.
+    rows: 연간표(연도 열, period는 연도) 또는 분기표(기간 열, period는 '2026Q2'. 순이익은 최근 4분기 합).
+    buyback: {종목코드: (올해, 전년) 자사주매입 주식수}. 없으면 연간표 rows에서 계산.
+    반환: (통과 행 목록, 단계별 남은 종목 수)
+    """
+    quarterly = isinstance(period, str)
+    if buyback is None:
+        buyback = annual_buyback_pairs(rows, period)
+    current = {r["종목코드"]: r for r in rows if (r["기간"] if quarterly else int(r["연도"])) == period}
 
     stages = {"전체": 0, "순유동자산>0·주가있음": 0, f"비율≤{max_ratio:g}": 0, "순이익조건": 0, "자사주매입증가": 0}
     passed = []
-    for code, years in by_code.items():
-        r = years.get(year)
-        if r is None:
-            continue
+    for code, r in current.items():
         stages["전체"] += 1
         ca, tl = _num(r["유동자산"]), _num(r["총부채"])
         m = market.get(code)
@@ -538,19 +555,18 @@ def screen_net_net(annual_rows: list[dict], year: int, market: dict[str, dict], 
         if status not in profit_status:
             continue
         stages["순이익조건"] += 1
-        cur = _num(r["자사주매입주식수"])
-        prev = _num(years.get(year - 1, {}).get("자사주매입주식수"))
+        cur, prev = buyback.get(code, (None, None))
         if buyback_up:
             if cur is None or prev is None or cur <= prev:
                 continue
             stages["자사주매입증가"] += 1
         passed.append({
-            "종목코드": code, "회사명": r["회사명"], "연도": year,
+            "종목코드": code, "회사명": r["회사명"], ("기간" if quarterly else "연도"): period,
             "종가": m["close"], "시가총액": m["mktcap"],
             "유동자산": ca, "총부채": tl, "순유동자산": ncav,
             "주당순유동자산": round(ncav / m["shares"], 2),
             "시총÷순유동자산": round(ratio, 3),
-            "순이익": _num(r["순이익"]),
+            "순이익": _num(r["순이익(최근4분기)" if quarterly else "순이익"]),
             f"순이익상태_{profit_years}년": status,
             f"순이익CAGR_{profit_years}년(%)": _num(r[f"순이익CAGR_{profit_years}년(%)"]),
             "자사주매입주식수": cur, "자사주매입주식수(전년)": prev,

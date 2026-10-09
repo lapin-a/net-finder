@@ -62,10 +62,10 @@ python main.py analyze-edgar microsoft           # 회사명 또는 그 일부, 
 
 ```bash
 # 한국 상장사 전체: 유동자산·총부채·순이익(다중회사 API, 100개씩) + KRX 발행주식수
-python main.py analyze-dart-batch 2015 2025
+python main.py analyze-dart-batch 2015 2026
 
 # + 연간 자사주매입 (회사별 호출, 연도당 약 5,500건). 적힌 연도 순서대로 수집
-python main.py analyze-dart-batch 2015 2025 --buyback 2025 2024
+python main.py analyze-dart-batch 2015 2026 --buyback 2025 2024
 
 # 미국: 티커가 A로 시작하는 회사 전체
 python main.py analyze-edgar-batch A
@@ -93,23 +93,30 @@ python main.py merge-edgar
 합친 결과 `data/analysis/edgar/{연간,분기}.csv`
 
 API 응답은 `data/cache/`에 저장됩니다. 한도 초과나 네트워크 오류로 멈춰도 같은 명령을 다시 실행하면 받은 부분은 건너뛰고 이어서 받습니다. DART 일일 한도(오류 020)에 걸리면 거기까지 저장하고 멈춥니다.
+제출기한(분기·반기 45일, 사업보고서 90일)에서 30일이 지나지 않은 보고서는 아직 덜 들어왔으므로 캐시하지 않고 매번 다시 받습니다.
+상장사 목록은 `data/dart/listed_corps.json`에 저장해 두고, 고유번호 API가 점검 등으로 막히면 이 파일을 씁니다.
 
 ### 넷넷 스크리너 (한국)
 
-`analyze-dart-batch` 연간 결과에 KRX 종가·시가총액을 붙여 조건을 통과한 종목만 저장합니다. DART 호출은 없습니다.
+`analyze-dart-batch` 연간(또는 분기) 결과에 KRX 종가·시가총액을 붙여 조건을 통과한 종목만 저장합니다. DART 호출은 없습니다.
 
 ```bash
 python main.py screen-dart                   # 최신 연도, 기본 조건
 python main.py screen-dart 2024 --ratio 1 --profit 흑자 --profit-years 5 --no-buyback
 python main.py screen-dart 2025 --price-date 20261007   # 연말 대신 해당일(직전 거래일) 주가
+python main.py screen-dart 2026Q2            # 분기 결과로 (주가는 분기 말일 기준)
+python main.py screen-dart --quarterly       # 최신 분기
 ```
 
 기본 조건 (모두 만족):
 - 시가총액 ÷ (유동자산 − 총부채) ≤ 2/3 (`--ratio`). 시가총액은 보통주와 우선주를 합친 값이고, 순유동자산이 0 이하면 제외합니다.
 - 최근 3년 순이익 상태가 흑자 또는 흑자전환 (`--profit`, `--profit-years`)
 - 자사주매입 주식수가 전년보다 많음 (`--no-buyback`으로 끔). 매입 데이터는 `--buyback`으로 받은 연도에만 있어서, 현재는 2025년만 이 조건을 적용할 수 있습니다.
+  분기 기준일 때는 분기 자사주매입을 수집하지 않으므로 그 분기보다 앞서 끝난 최신 연간 값(현재 2025년 vs 2024년)으로 판단합니다.
+- 분기 기준의 순이익 상태는 최근 4분기 합으로 계산합니다.
+- 연도·분기를 생략하면 자료가 충분한(가장 많은 기간의 절반 이상) 최신 기간을 씁니다. 결산월이 12월이 아닌 회사 몇십 곳만 있는 기간은 건너뜁니다.
 
-→ `data/analysis/dart/screen_<연도>_<주가기준일>.csv` (시총÷순유동자산이 낮은 순). 조건만 바꿔 다시 실행하면 같은 파일을 덮어씁니다.
+→ `data/analysis/dart/screen_<연도|분기>_<주가기준일>.csv` (시총÷순유동자산이 낮은 순). 조건만 바꿔 다시 실행하면 같은 파일을 덮어씁니다.
 
 ### 원본 데이터
 
