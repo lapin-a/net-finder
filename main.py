@@ -23,6 +23,7 @@
     python main.py fix-edgar-buyback             # companyfacts 자사주매입 주식수 중 이상한 값을 XBRL 원문 값으로 교체
     python main.py refresh-edgar PRTH WTBA       # 일부 회사만 companyfacts로 다시 계산해 글자별 파일에 반영
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
+    python main.py us-prices                     # 미국 월별 주가 (Alpaca, 2016년부터) → edgar/주가_월별.csv
 
     # 넷넷 스크리너 (analyze-dart-batch 결과 + KRX 종가·시가총액)
     python main.py screen-dart                   # 최신 연도, 기본 조건
@@ -38,13 +39,13 @@ import sys
 import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 import analysis
-from collectors import DartClient, EdgarClient, KrxClient
+from collectors import AlpacaClient, DartClient, EdgarClient, KrxClient
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -665,6 +666,55 @@ def fill_krx_shares(results: dict, corps: dict, start: int, end: int) -> None:
         print(f"{year} KRX 상장주식수 완료", flush=True)
 
 
+def _alpaca_bars(alpaca: AlpacaClient, symbols: list[str], start: str, end: str, adjustment: str,
+                 skipped: list[str]) -> dict:
+    """여러 종목 월봉. Alpaca가 모르는 종목이 섞여 요청이 거부되면 반씩 나눠 다시 받고, 끝내 안 되는 종목은 skipped에 넣는다."""
+    try:
+        return alpaca.bars(symbols, start, end, adjustment=adjustment)
+    except RuntimeError as e:
+        if len(symbols) == 1:
+            skipped.append(f"{symbols[0]} ({str(e)[:80]})")
+            return {}
+        half = len(symbols) // 2
+        return {**_alpaca_bars(alpaca, symbols[:half], start, end, adjustment, skipped),
+                **_alpaca_bars(alpaca, symbols[half:], start, end, adjustment, skipped)}
+
+
+def us_prices(chunk: int = 200) -> None:
+    """EDGAR 합친 결과의 티커 전체에 대해 Alpaca 월봉(2016년 1월 ~ 지난달)을 받아 주가_월별.csv로 저장한다.
+
+    종가는 분할 미반영 원래 값(공시 주식수와 곱해 시가총액 계산용)과 분할 반영 값을 같이 둔다.
+    분할배율 = 원래 ÷ 분할 반영: 이후 분할이 있으면 1이 아닌 값이 되고, 분할 시점에 값이 바뀐다 (주식분할 검증용).
+    """
+    alpaca = AlpacaClient(os.getenv("ALPACA_KEY_ID", ""), os.getenv("ALPACA_SECRET_KEY", ""),
+                          cache_dir=DATA_DIR / "cache/alpaca")
+    tickers = sorted({r["티커"] for r in _load_csv(DATA_DIR / "analysis/edgar/분기.csv")})
+    symbol_of = {t: t.replace("-", ".") for t in tickers}  # SEC BRK-B → Alpaca BRK.B
+    ticker_of = {s: t for t, s in symbol_of.items()}
+    symbols = sorted(ticker_of)
+    start = "2016-01-01"
+    end = (date.today().replace(day=1) - timedelta(days=1)).isoformat()  # 지난달 말 (끝난 달만 캐시)
+
+    raw, split, skipped = {}, {}, []
+    for i in range(0, len(symbols), chunk):
+        part = symbols[i:i + chunk]
+        raw.update(_alpaca_bars(alpaca, part, start, end, "raw", skipped))
+        split.update(_alpaca_bars(alpaca, part, start, end, "split", []))
+        print(f"{min(i + chunk, len(symbols))}/{len(symbols)}개 종목, 가격 있는 종목 {len(raw)}", flush=True)
+
+    rows = []
+    for symbol in sorted(raw):
+        adjusted = {b["t"][:7]: b["c"] for b in split.get(symbol, [])}
+        for b in raw[symbol]:
+            month = b["t"][:7]
+            rows.append({"티커": ticker_of.get(symbol, symbol), "월": month, "종가": b["c"],
+                         "종가(분할반영)": adjusted.get(month),
+                         "분할배율": round(b["c"] / adjusted[month], 4) if adjusted.get(month) else None,
+                         "VWAP": b.get("vw"), "거래량": b.get("v")})
+    save_csv("analysis/edgar/주가_월별.csv", rows, ["티커", "월", "종가", "종가(분할반영)", "분할배율", "VWAP", "거래량"])
+    print(f"가격 있는 종목 {len(raw)} / {len(symbols)}, 요청 거부 {len(skipped)}개: {', '.join(skipped[:20])}")
+
+
 def _listed_corps(dart: DartClient) -> list[dict]:
     """종목코드가 있는 회사 목록. 받을 때마다 data/dart/listed_corps.json에 저장해 두고,
     고유번호 API가 점검 등으로 막히면(zip 대신 오류 XML이 옴) 저장해 둔 목록을 쓴다."""
@@ -764,6 +814,9 @@ def main(argv: list[str]) -> None:
         refresh_edgar_tickers(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
     elif cmd == "merge-edgar":
         merge_edgar(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
+
+    elif cmd == "us-prices":
+        us_prices()
 
     elif cmd == "screen-dart":
         screen_dart(args)

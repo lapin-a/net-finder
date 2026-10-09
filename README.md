@@ -87,6 +87,10 @@ python main.py refresh-edgar PRTH WTBA
 
 # 글자별 결과를 하나로 합침 (batch_AA 제외, 같은 회사(CIK)는 대표 티커 하나만, CIK 열 추가)
 python main.py merge-edgar
+
+# 미국 월별 주가 (Alpaca 무료 계정, 2016년 1월 ~ 지난달). .env에 ALPACA_KEY_ID, ALPACA_SECRET_KEY 필요
+# 원래 종가(분할 미반영)·분할 반영 종가·분할배율·VWAP → data/analysis/edgar/주가_월별.csv
+python main.py us-prices
 ```
 
 → `data/analysis/dart/batch_상장사_{분기,연간}.csv`, `data/analysis/edgar/batch_<글자>_{분기,연간,실패}.csv`,
