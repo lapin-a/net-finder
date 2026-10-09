@@ -412,7 +412,8 @@ def edgar_records(facts: dict):
     periods = {end: (fy, q) for end, fy, q in period_of_accn.values()}
     ends = sorted(periods)
 
-    quarters = {periods[end]: {"year": periods[end][0], "q": periods[end][1]} for end in ends}
+    # 같은 (회계연도, 분기)에 종료일이 여럿 남으면(겹침) 값과 같이 늦은 종료일이 들어간다
+    quarters = {periods[end]: {"year": periods[end][0], "q": periods[end][1], "end": end} for end in ends}
     annual = {}
 
     def latest(entries):
@@ -468,7 +469,7 @@ def edgar_records(facts: dict):
 
     for rec in quarters.values():
         if rec["q"] == 4 and rec["year"] in annual:
-            annual[rec["year"]].update({k: rec.get(k) for k in BALANCE_KEYS})
+            annual[rec["year"]].update({k: rec.get(k) for k in (*BALANCE_KEYS, "end")})
 
     return quarters, annual
 
@@ -537,8 +538,8 @@ def quarterly_table(quarters: dict) -> list[dict]:
             return None if None in vals else sum(vals)
 
         ni_ttm = ttm(year, q, "net_income")
-        row = {
-            "기간": f"{year}Q{q}",
+        row = {"기간": f"{year}Q{q}", **({"종료일": rec["end"]} if "end" in rec else {})}  # 종료일은 EDGAR만
+        row |= {
             "유동자산": rec.get("current_assets"),
             "총부채": rec.get("total_liabilities"),
             "발행주식수": last_shares,  # 해당 분기에 공시가 없으면 직전 값 사용
@@ -562,8 +563,8 @@ def annual_table(annual: dict) -> list[dict]:
     rows = []
     for year in sorted(annual):
         rec = annual[year]
-        row = {
-            "연도": year,
+        row = {"연도": year, **({"종료일": rec.get("end")} if "end" in rec else {})}
+        row |= {
             "유동자산": rec.get("current_assets"),
             "총부채": rec.get("total_liabilities"),
             "발행주식수": rec.get("shares"),
