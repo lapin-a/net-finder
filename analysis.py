@@ -521,6 +521,27 @@ def detect_splits(rows: list[dict], id_keys: tuple[str, ...], period_key: str = 
     return found
 
 
+# ---------------------------------------------------------------- 기간 평균 주가 (자사주매입 주식수 추정)
+
+def period_vwap(bars: dict, end: date, months: int, min_months: int):
+    """월봉 {'YYYY-MM': (VWAP, 거래량)}에서 종료일까지 months개월의 거래량 가중 평균 주가와 쓴 달 수.
+
+    종료일이 15일 전이면(52·53주 회계연도의 10월 초 마감 등) 그 전달을 마지막 달로 본다.
+    가격이 있는 달이 min_months개 미만이면 (None, 달 수).
+    """
+    year, month = end.year, end.month - (end.day < 15)
+    used = []
+    for _ in range(months):
+        if month == 0:
+            year, month = year - 1, 12
+        if (bar := bars.get(f"{year}-{month:02d}")) and bar[1] > 0:
+            used.append(bar)
+        month -= 1
+    if len(used) < min_months:
+        return None, len(used)
+    return sum(p * v for p, v in used) / sum(v for _, v in used), len(used)
+
+
 # ---------------------------------------------------------------- 분석표
 
 CAGR_YEARS = (3, 5, 10)

@@ -21,6 +21,7 @@
     python main.py fill-edgar-buyback --recheck  # 이미 XBRL·추정으로 채운 칸도 지금 규칙으로 다시 확인
     python main.py fill-edgar-buyback-quarterly  # 분기 자사주매입 주식수 빈칸(·0주)을 10-Q·10-K XBRL 원문으로 채움
     python main.py fix-edgar-buyback             # companyfacts 자사주매입 주식수 중 이상한 값을 XBRL 원문 값으로 교체
+    python main.py estimate-edgar-buyback        # 그래도 남은 자사주매입 주식수 빈칸(연간·분기)을 금액 ÷ 기간 평균 주가로 추정
     python main.py refresh-edgar PRTH WTBA       # 일부 회사만 companyfacts로 다시 계산해 글자별 파일에 반영
     python main.py fill-edgar-ends               # 글자별 결과에 보고기간 종료일 열 추가 (값은 그대로)
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
@@ -216,6 +217,24 @@ def _save_edgar_annual(path: Path, rows: list[dict]) -> None:
     save_csv(f"analysis/edgar/{path.name}", rows, fields)
 
 
+def _save_edgar_quarterly(path: Path, rows: list[dict]) -> None:
+    """EDGAR 분기표 저장: 자사주매입 주식수 연초누적·전년 동기 대비를 다시 계산하고 출처 열을 주식수 옆에 둔다."""
+    num, src_col = analysis._num, "자사주매입주식수(분기)_출처"
+    by_key = {(r["티커"], r["기간"]): r for r in rows}
+    for r in rows:
+        fy, q = int(r["기간"][:4]), int(r["기간"][-1])
+        parts = [by_key.get((r["티커"], f"{fy}Q{k}"), {}).get("자사주매입주식수(분기)", "") for k in range(1, q + 1)]
+        r["자사주매입주식수(연초누적)"] = "" if "" in parts else sum(num(v) for v in parts)
+    for r in rows:
+        prev = by_key.get((r["티커"], f"{int(r['기간'][:4]) - 1}{r['기간'][4:]}"))
+        r["자사주매입주식수_전년동기대비(%)"] = analysis._growth(num(r["자사주매입주식수(연초누적)"]),
+                                                     num(prev and prev["자사주매입주식수(연초누적)"]))
+    fields = [k for k in rows[0] if k != src_col] if rows else []
+    if fields:
+        fields.insert(fields.index("자사주매입주식수(분기)") + 1, src_col)
+    save_csv(f"analysis/edgar/{path.name}", rows, fields)
+
+
 def _letter_paths(kind: str) -> list[Path]:
     """글자별 일괄 결과 파일. batch_AA는 A 파일과 겹치므로 제외."""
     return [p for p in sorted((DATA_DIR / "analysis/edgar").glob(f"batch_*_{kind}.csv"))
@@ -394,19 +413,7 @@ def fill_edgar_buyback_quarterly(edgar: EdgarClient, letters: list[str], workers
                 if i % 50 == 0:
                     print(f"{path.stem}: {i}/{len(jobs)}개 회사, 공시 {searched}건 확인, {filled}칸 채움", flush=True)
 
-        # 연초누적·전년 동기 대비 다시 계산
-        for r in rows:
-            fy, q = int(r["기간"][:4]), int(r["기간"][-1])
-            parts = [by_key.get((r["티커"], f"{fy}Q{k}"), {}).get("자사주매입주식수(분기)", "") for k in range(1, q + 1)]
-            r["자사주매입주식수(연초누적)"] = "" if "" in parts else sum(num(v) for v in parts)
-        for r in rows:
-            prev = by_key.get((r["티커"], f"{int(r['기간'][:4]) - 1}{r['기간'][4:]}"))
-            r["자사주매입주식수_전년동기대비(%)"] = analysis._growth(num(r["자사주매입주식수(연초누적)"]),
-                                                         num(prev and prev["자사주매입주식수(연초누적)"]))
-        fields = [k for k in rows[0] if k != src_col] if rows else []
-        if fields:
-            fields.insert(fields.index("자사주매입주식수(분기)") + 1, src_col)
-        save_csv(f"analysis/edgar/{path.name}", rows, fields)
+        _save_edgar_quarterly(path, rows)
         print(f"{path.stem}: 빈칸 {sum(len(g) for g in gaps.values())}칸 중 {filled}칸 채움, "
               f"평균 매입가 이상으로 제외 {rejected}칸, 실패 {failed}개 회사 (공시 {searched}건 확인)", flush=True)
 
@@ -603,6 +610,82 @@ def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6,
               f"평균 매입가 이상으로 제외 {rejected}칸, 인접 연도와 안 맞는 추정치 비움 {dropped}칸 (10-K {searched}건 확인)", flush=True)
 
 
+PRICE_ESTIMATE = "주가 추정"
+
+
+def estimate_edgar_buyback(max_share_ratio: float = 0.5) -> None:
+    """EDGAR 글자별 결과(연간·분기)에서 자사주매입 금액은 있는데 주식수가 없는 칸을 금액 ÷ 기간 평균 주가로 추정한다.
+
+    평균 주가: Alpaca 월봉 VWAP(원래 가격)의 거래량 가중 평균. 연간은 종료일까지 12개월(8개월 이상 있어야 함),
+    분기는 3개월(2개월 이상). 주가가 2016년부터라 그 전 기간은 못 채운다.
+    대상: 빈칸(XBRL로도 못 채운 칸, 틀린 companyfacts 값을 뺀 '제외:' 칸 포함)과 분기의 companyfacts 0주.
+    거르기: 추정 주식수가 발행주식수의 max_share_ratio배 초과, 평균 주가가 같은 회사 인접 기간(연간 ±2년, 분기 ±4분기)
+    실제 평균 매입가 중앙값의 1/3~3배 밖.
+    출처 열: '주가 추정: VWAP $x, n개월 / 이전: <원래 출처>'. 다시 실행하면 이전 추정을 되돌린 뒤 다시 계산한다.
+    """
+    num, (lo, hi) = analysis._num, BUYBACK_PRICE_RANGE
+    bars = {}
+    for r in _load_csv(DATA_DIR / "analysis/edgar/주가_월별.csv"):
+        if r["VWAP"] and r["거래량"]:
+            bars.setdefault(r["티커"], {})[r["월"]] = (float(r["VWAP"]), float(r["거래량"]))
+
+    specs = {  # 종류: (금액 열, 주식수 열, 출처 열, 개월, 최소 개월, 인접 범위, 기간 → 순번)
+        "연간": ("자사주매입", "자사주매입주식수", "자사주매입주식수_출처", 12, 8, 2, lambda r: int(r["연도"])),
+        "분기": ("자사주매입(분기)", "자사주매입주식수(분기)", "자사주매입주식수(분기)_출처", 3, 2, 4,
+                 lambda r: int(r["기간"][:4]) * 4 + int(r["기간"][-1]) - 1),
+    }
+    for kind, (amount_col, shares_col, src_col, months, min_months, near, index) in specs.items():
+        totals = Counter()
+        for path in _letter_paths(kind):
+            rows = _load_csv(path)
+            for r in rows:
+                if r.get(src_col) is None:
+                    r[src_col] = "companyfacts" if r[shares_col] != "" else ""
+                if r[src_col].startswith(PRICE_ESTIMATE):  # 이전 실행 되돌리기
+                    r[src_col] = r[src_col].partition(" / 이전: ")[2]
+                    r[shares_col] = 0 if r[src_col] == "companyfacts" else ""
+
+            price = {}  # (티커, 순번) → 실제 평균 매입가 (비교용)
+            for r in rows:
+                a, s = num(r[amount_col]), num(r[shares_col])
+                if (a and a > 0 and s and s > 0 and lo <= a / s <= hi
+                        and not r[src_col].startswith(("추정", "제외"))):
+                    price[(r["티커"], index(r))] = a / s
+
+            stats = Counter()
+            for r in rows:
+                a, s, source = num(r[amount_col]), num(r[shares_col]), r[src_col]
+                if not (a and a > 0) or not (s is None and (source == "" or source.startswith("제외"))
+                                             or s == 0 and source == "companyfacts"):
+                    continue
+                stats["대상"] += 1
+                vwap, n = (analysis.period_vwap(bars[r["티커"]], date.fromisoformat(r["종료일"]), months, min_months)
+                           if r["티커"] in bars and r["종료일"] else (None, 0))
+                if vwap is None:
+                    stats["주가 없음"] += 1
+                    continue
+                shares = round(a / vwap)
+                outstanding = num(r["발행주식수"])
+                i = index(r)
+                nearby = [price[(r["티커"], i + k)] for k in range(-near, near + 1) if k and (r["티커"], i + k) in price]
+                if outstanding and shares > outstanding * max_share_ratio:
+                    stats["발행주식수 대비 과다"] += 1
+                elif nearby and not 1 / 3 <= vwap / statistics.median(nearby) <= 3:
+                    stats["인접 매입가와 불일치"] += 1
+                else:
+                    r[shares_col] = shares
+                    r[src_col] = f"{PRICE_ESTIMATE}: VWAP ${vwap:.2f}, {n}개월 / 이전: {source}"
+                    stats["채움"] += 1
+
+            if kind == "연간":
+                _save_edgar_annual(path, rows)
+            else:
+                _save_edgar_quarterly(path, rows)
+            totals += stats
+            print(f"{path.stem}: " + ", ".join(f"{k} {v}" for k, v in stats.items()), flush=True)
+        print(f"{kind} 합계: " + ", ".join(f"{k} {v:,}" for k, v in totals.items()), flush=True)
+
+
 def detect_splits() -> None:
     """일괄 분석 결과(분기표)의 발행주식수 변화로 주식분할·병합 후보를 찾는다. API 호출 없음."""
     def load(path):
@@ -690,6 +773,7 @@ def screen_edgar(args: list[str]) -> None:
     --ratio, --profit, --profit-years, --no-buyback   screen-dart와 같음
     --lag N              기준일보다 N일 이상 앞서 끝난 분기만 사용 (기본 45, 10-Q 제출기한). 9개월보다 오래된 분기는 제외
     --annual-lag N       자사주매입 비교에 쓸 회계연도도 같은 방식 (기본 90, 10-K 제출기한)
+    --stale N            발행주식수가 N분기 이상 같은 값이면 제외 (기본 5, 공시가 끊긴 값을 이어 쓴 경우)
 
     회사마다 회계연도가 달라서, 기준일에 이미 공시됐을 최신 분기를 회사별로 고른다.
     시가총액 = 월말 원래 종가 × 그 분기 발행주식수(표지 값, 주식 종류 합산).
@@ -707,8 +791,9 @@ def screen_edgar(args: list[str]) -> None:
     lag, annual_lag = int(opt("--lag", 45)), int(opt("--annual-lag", 90))
     close = {r["티커"]: float(r["종가"]) for r in prices if r["월"] == month}
 
-    latest, start = {}, as_of - timedelta(days=lag + 270)
+    latest, start, shares_history = {}, as_of - timedelta(days=lag + 270), {}
     for r in _load_csv(edgar_dir / "분기.csv"):
+        shares_history.setdefault(r["티커"], []).append((r["기간"], r["발행주식수"]))
         end = r["종료일"] and date.fromisoformat(r["종료일"])
         if (end and start <= end <= as_of - timedelta(days=lag) and r["주당순유동자산"]
                 and not NON_COMMON_TICKER.search(r["티커"])):
@@ -718,15 +803,29 @@ def screen_edgar(args: list[str]) -> None:
     annual_by = {}
     for r in _load_csv(edgar_dir / "연간.csv"):
         annual_by.setdefault(r["티커"], {})[int(r["연도"])] = r
+    def buyback_shares(r):  # 매입 금액이 0으로 공시됐으면 0주 (매입 안 한 해)
+        shares = analysis._num(r.get("자사주매입주식수"))
+        return 0 if shares is None and analysis._num(r.get("자사주매입")) == 0 else shares
+
     buyback = {}
     for ticker, years in annual_by.items():
         done = [y for y, r in years.items() if r["종료일"] and date.fromisoformat(r["종료일"]) <= as_of - timedelta(days=annual_lag)]
         if done:
             y = max(done)
-            buyback[ticker] = (analysis._num(years[y]["자사주매입주식수"]),
-                               analysis._num(years.get(y - 1, {}).get("자사주매입주식수")))
+            buyback[ticker] = (buyback_shares(years[y]), buyback_shares(years.get(y - 1, {})))
 
     # screen_net_net은 종목코드·기간 열로 고르므로 회사별로 고른 분기를 같은 이름으로 맞춰 넘긴다
+    # 표지 주식수가 오래 그대로면 공시가 끊긴 값을 이어 쓴 것 (주식 종류별로만 공시하는 회사 등) → 시가총액이 틀리므로 뺀다
+    stale_quarters = int(opt("--stale", 5))
+    stale = []
+    for t, r in list(latest.items()):
+        before = sorted(p for p in shares_history[t] if p[0] <= r["기간"])
+        same = next((i for i, (_, v) in enumerate(reversed(before)) if v != r["발행주식수"]), len(before))
+        if same >= stale_quarters:
+            stale.append(t)
+            del latest[t]
+    print(f"발행주식수가 {stale_quarters}분기 넘게 같은 값이라 제외: {len(stale)}곳")
+
     rows = [{**r, "종목코드": t, "기간": "기준"} for t, r in latest.items()]
     market = {t: {"close": close[t], "shares": float(r["발행주식수"]), "mktcap": close[t] * float(r["발행주식수"])}
               for t, r in latest.items() if t in close and float(r["발행주식수"]) > 0}
@@ -913,6 +1012,8 @@ def main(argv: list[str]) -> None:
         fill_edgar_buyback_quarterly(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
     elif cmd == "fix-edgar-buyback":
         fix_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
+    elif cmd == "estimate-edgar-buyback":
+        estimate_edgar_buyback()
     elif cmd == "refresh-edgar":
         refresh_edgar_tickers(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
     elif cmd == "fill-edgar-ends":
