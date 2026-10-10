@@ -663,10 +663,10 @@ def annual_buyback_pairs(annual_rows: list[dict], year: int) -> dict:
 
 
 def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio: float,
-                   profit_years: int, profit_status: set[str], buyback_up: bool, buyback: dict | None = None):
+                   profit_years: int, profit_status: set[str] | None, buyback_up: bool, buyback: dict | None = None):
     """연간 또는 분기 일괄 결과에서 넷넷 종목을 거른다.
 
-    시가총액 ÷ (유동자산 - 총부채) ≤ max_ratio, 최근 profit_years년 순이익 상태가 profit_status 중 하나,
+    시가총액 ÷ (유동자산 - 총부채) ≤ max_ratio, 최근 profit_years년 순이익 상태가 profit_status 중 하나(None이면 조건 없음),
     (buyback_up이면) 자사주매입 주식수가 전년보다 많은 종목.
     rows: 연간표(연도 열, period는 연도) 또는 분기표(기간 열, period는 '2026Q2'. 순이익은 최근 4분기 합).
     buyback: {종목코드: (올해, 전년) 자사주매입 주식수}. 없으면 연간표 rows에서 계산.
@@ -695,7 +695,7 @@ def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio:
             continue
         stages[f"비율≤{max_ratio:g}"] += 1
         status = r[f"순이익상태_{profit_years}년"]
-        if status not in profit_status:
+        if profit_status is not None and status not in profit_status:
             continue
         stages["순이익조건"] += 1
         cur, prev = buyback.get(code, (None, None))
@@ -715,6 +715,8 @@ def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio:
             f"순이익CAGR_{profit_years}년(%)": _num(r[f"순이익CAGR_{profit_years}년(%)"]),
             "자사주매입주식수": cur, "자사주매입주식수(전년)": prev,
         })
+    if profit_status is None:
+        del stages["순이익조건"]
     if not buyback_up:
         del stages["자사주매입증가"]
     passed.sort(key=lambda x: x["시총÷순유동자산"])

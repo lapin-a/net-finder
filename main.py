@@ -773,6 +773,7 @@ def screen_dart(args: list[str]) -> None:
     --ratio R            시가총액 ÷ (유동자산 - 총부채) 상한 (기본 0.667 = 그레이엄 2/3)
     --profit A,B         허용할 순이익 상태 (기본 흑자,흑자전환)
     --profit-years N     순이익 상태를 볼 기간 3/5/10 (기본 3)
+    --no-profit          순이익 상태 조건 끄기
     --no-buyback         자사주매입 주식수 전년 대비 증가 조건 끄기
                          (분기 기준일 때는 그 분기 이전 최신 연간 자사주매입으로 판단)
     --price-date YYYYMMDD  주가 기준일 (기본: 해당 연도·분기 말일, 휴장이면 직전 거래일)
@@ -808,7 +809,7 @@ def screen_dart(args: list[str]) -> None:
         period = year = int(positional[0] if positional else latest(annual, "연도"))
         month, day = 12, 31
     max_ratio = float(opt("--ratio", 2 / 3))
-    profit_status = set(opt("--profit", "흑자,흑자전환").split(","))
+    profit_status = None if "--no-profit" in args else set(opt("--profit", "흑자,흑자전환").split(","))
     profit_years = int(opt("--profit-years", 3))
     price_date = opt("--price-date", f"{year}{month:02d}{day:02d}")
 
@@ -832,7 +833,7 @@ PREFERRED_TICKER = re.compile(r"-P[A-Z]?$")  # 우선주 티커 (JPM-PC 등)
 def screen_edgar(args: list[str]) -> None:
     """미국 넷넷 스크리너. EDGAR 합친 결과 + Alpaca 월말 원래 종가. 옵션:
     [YYYY-MM]            주가 기준 월 (기본: 주가 파일의 최신 월)
-    --ratio, --profit, --profit-years, --no-buyback   screen-dart와 같음
+    --ratio, --profit, --profit-years, --no-profit, --no-buyback   screen-dart와 같음
     --lag N              기준일보다 N일 이상 앞서 끝난 분기만 사용 (기본 45, 10-Q 제출기한). 9개월보다 오래된 분기는 제외
     --annual-lag N       자사주매입 비교에 쓸 회계연도도 같은 방식 (기본 90, 10-K 제출기한)
 
@@ -883,7 +884,7 @@ def screen_edgar(args: list[str]) -> None:
     print(f"주가 {month} 말 / 분기 종료일 {start} ~ {as_of - timedelta(days=lag)} / "
           f"가격 있는 종목 {len(close)}, 조건에 맞는 분기가 있는 회사 {len(latest)}")
     passed, stages = analysis.screen_net_net(rows, "기준", market, max_ratio, profit_years,
-                                             set(opt("--profit", "흑자,흑자전환").split(",")),
+                                             None if "--no-profit" in args else set(opt("--profit", "흑자,흑자전환").split(",")),
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
     for name, count in stages.items():
         print(f"  {name}: {count}")
