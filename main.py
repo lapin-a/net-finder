@@ -312,7 +312,7 @@ def fill_edgar_ends(edgar: EdgarClient, workers: int = 6) -> None:
 
 
 EDGAR_BALANCE_COLUMNS = {  # 지금 규칙으로 다시 계산하는 열: 앞 열 → 그 뒤에 둘 열
-    "총부채": ["우선주", "비지배지분"],
+    "총부채": ["우선주", "우선주_출처", "비지배지분"],
     "발행주식수": ["발행주식수_출처"],  # 분기표만
 }
 
@@ -320,12 +320,12 @@ EDGAR_BALANCE_COLUMNS = {  # 지금 규칙으로 다시 계산하는 열: 앞 �
 def fill_edgar_balance(edgar: EdgarClient, workers: int = 6) -> None:
     """글자별 일괄 결과(연간·분기)의 재무상태표 파생 열만 지금 규칙으로 다시 계산한다. 나머지 열(채운 자사주매입)은 그대로.
 
-    다시 계산하는 열: 우선주·비지배지분, 발행주식수(분기표는 '발행주식수_출처'), 주당순유동자산.
+    다시 계산하는 열: 우선주(·우선주_출처)·비지배지분, 발행주식수(분기표는 '발행주식수_출처'), 주당순유동자산.
     - 발행주식수: 표지 값이 없는 분기는 3개월 가중평균, 둘 다 없으면 직전 값을 최대 3분기까지
     - 주당순유동자산 = (유동자산 − 총부채 − 우선주 − 비지배지분) ÷ 발행주식수
     """
     ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
-    redone = ["우선주", "비지배지분", "발행주식수", "발행주식수_출처", "주당순유동자산"]
+    redone = ["우선주", "우선주_출처", "비지배지분", "발행주식수", "발행주식수_출처", "주당순유동자산"]
 
     def tables(cik):
         quarters, annual = analysis.edgar_records(edgar.company_facts(cik))
@@ -830,6 +830,84 @@ NON_COMMON_TICKER = re.compile(r"^[A-Z]{4}[WUR]$|-(WT|WS|U|UN|R|RT)$")
 PREFERRED_TICKER = re.compile(r"-P[A-Z]?$")  # 우선주 티커 (JPM-PC 등)
 
 
+def _cover_classes(edgar: EdgarClient, cik: str, end: str) -> list[dict]:
+    """보고기간 종료일이 end인 10-Q·10-K 표지의 주식 종류별 발행주식수·티커 (data/cache/edgar_xbrl/cover_<CIK>_<종료일>.json)."""
+    cache = DATA_DIR / "cache/edgar_xbrl" / f"cover_{int(cik)}_{end}.json"
+    if cache.exists():
+        return json.loads(cache.read_text(encoding="utf-8"))
+    filings = [f for f in edgar.filings(cik, ("10-Q", "10-K", "10-Q/A", "10-K/A"), include_older=True) if f["reportDate"] == end]
+    filings.sort(key=lambda f: (f["form"].endswith("/A"), f["filingDate"]))  # 원본 공시 먼저
+    classes = []
+    for f in filings[:1]:
+        try:
+            classes = analysis.xbrl_cover_classes(edgar.filing_instance(cik, f["accessionNumber"]))
+        except (FileNotFoundError, SyntaxError):
+            pass
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(classes, ensure_ascii=False), encoding="utf-8")
+    return classes
+
+
+def _class_market_caps(edgar: EdgarClient, latest: dict, market: dict, close: dict, others: dict, month: str) -> dict:
+    """주식 종류가 여럿인 회사(같은 CIK에 보통주 티커가 둘 이상)의 시가총액을 종류별 주식수 × 종류별 종가로 다시 계산한다.
+
+    대표 티커 가격 × 전체 주식수는 종류끼리 가격이 다르면 틀린다 (HEI-A는 HEI보다 싸고, BRK-A는 BRK-B의 1,500배).
+    순유동자산이 양수인 회사만 (나머지는 어차피 탈락). 티커가 없는 종류(비상장)는 대표 티커 가격으로 본다.
+    market을 고쳐 쓰고, 반환: {티커: 계산 설명}
+    """
+    num = analysis._num
+    targets = {}
+    for t, r in latest.items():
+        if t not in market or len(others.get(r["CIK"], [])) < 2:
+            continue
+        ca, tl = num(r["유동자산"]), num(r["총부채"])
+        if ca is None or tl is None or ca - tl - (num(r.get("우선주")) or 0) - max(num(r.get("비지배지분")) or 0, 0) <= 0:
+            continue
+        # 표지에 우선주까지 적는 회사가 있음 (FBIO의 FBIOP) → 보통주 종류만
+        classes = [c for c in _cover_classes(edgar, r["CIK"], r["종료일"]) if "Preferred" not in c["member"]
+                   and not (c["symbol"] and (c["symbol"].endswith("P") and c["symbol"][:-1] == t
+                                             or PREFERRED_TICKER.search(c["symbol"]) or NON_COMMON_TICKER.search(c["symbol"])))]
+        if len(classes) >= 2 and all(c["shares"] > 0 for c in classes):
+            targets[t] = classes
+
+    sec_ticker = {o.replace("-", ""): o for os_ in others.values() for o in os_ if "-" in o}
+
+    def ticker(symbol):  # 표지 티커 BRK.B, HEI A, BFB → SEC 형식 BRK-B, HEI-A, BF-B
+        if not symbol:
+            return None
+        symbol = symbol.replace(".", "-").replace(" ", "-")
+        return sec_ticker.get(symbol, symbol)
+
+    missing = sorted({ticker(c["symbol"]) for cs in targets.values() for c in cs
+                      if c["symbol"] and ticker(c["symbol"]) not in close})
+    if missing:
+        alpaca = AlpacaClient(os.getenv("ALPACA_KEY_ID", ""), os.getenv("ALPACA_SECRET_KEY", ""),
+                              cache_dir=DATA_DIR / "cache/alpaca")
+        year, mon = int(month[:4]), int(month[5:7])
+        last_day = (date(year + mon // 12, mon % 12 + 1, 1) - timedelta(days=1)).isoformat()
+        bars = _alpaca_bars(alpaca, [m.replace("-", ".") for m in missing], f"{month}-01", last_day, "raw", [])
+        close = {**close, **{s.replace(".", "-"): b[-1]["c"] for s, b in bars.items() if b}}
+    notes = {}
+    for t, classes in targets.items():
+        parts, mktcap = [], 0
+        for c in classes:
+            s = ticker(c["symbol"])
+            price = close.get(s) if s else None
+            if not s:  # 티커가 하나도 안 적힌 표지는 비상장인지 알 수 없음
+                kind = "비상장" if any(x["symbol"] for x in classes) else "티커 미표기"
+                label = f"{c['member'] or '차원 없음'}({kind}→{t} 가격)"
+            elif price is None:
+                label = f"{s}(가격 없음→{t} 가격)"
+            else:
+                label = s
+            price = close[t] if price is None else price
+            mktcap += c["shares"] * price
+            parts.append(f"{label} {c['shares']:,.0f}주×${price:,.2f}")
+        market[t] = {"close": close[t], "shares": sum(c["shares"] for c in classes), "mktcap": mktcap}
+        notes[t] = "종류별: " + " + ".join(parts)
+    return notes
+
+
 def screen_edgar(args: list[str]) -> None:
     """미국 넷넷 스크리너. EDGAR 합친 결과 + Alpaca 월말 원래 종가. 옵션:
     [YYYY-MM]            주가 기준 월 (기본: 주가 파일의 최신 월)
@@ -879,10 +957,17 @@ def screen_edgar(args: list[str]) -> None:
     rows = [{**r, "종목코드": t, "기간": "기준"} for t, r in latest.items()]
     market = {t: {"close": close[t], "shares": float(r["발행주식수"]), "mktcap": close[t] * float(r["발행주식수"])}
               for t, r in latest.items() if t in close and float(r["발행주식수"]) > 0}
+    edgar = EdgarClient(os.getenv("EDGAR_USER_AGENT", ""))
+    others = {}  # CIK → 보통주 티커들 (우선주·워런트 등 제외)
+    for c in edgar.tickers():
+        if not PREFERRED_TICKER.search(c["ticker"]) and not NON_COMMON_TICKER.search(c["ticker"]):
+            others.setdefault(c["cik"], []).append(c["ticker"])
+    class_notes = _class_market_caps(edgar, latest, market, close, others, month)
     max_ratio = float(opt("--ratio", 2 / 3))
     profit_years = int(opt("--profit-years", 3))
     print(f"주가 {month} 말 / 분기 종료일 {start} ~ {as_of - timedelta(days=lag)} / "
-          f"가격 있는 종목 {len(close)}, 조건에 맞는 분기가 있는 회사 {len(latest)}")
+          f"가격 있는 종목 {len(close)}, 조건에 맞는 분기가 있는 회사 {len(latest)}, "
+          f"주식 종류별로 시가총액을 다시 계산한 회사 {len(class_notes)}")
     passed, stages = analysis.screen_net_net(rows, "기준", market, max_ratio, profit_years,
                                              None if "--no-profit" in args else set(opt("--profit", "흑자,흑자전환").split(",")),
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
@@ -891,16 +976,15 @@ def screen_edgar(args: list[str]) -> None:
     out = []
     for p in passed:
         r = latest[p["종목코드"]]
-        out.append({"CIK": r["CIK"], "티커": p.pop("종목코드"), "회사명": p.pop("회사명"),
-                    "기간": r["기간"], "종료일": r["종료일"], **{k: v for k, v in p.items() if k != "기간"},
-                    "발행주식수": r["발행주식수"], "발행주식수_출처": r.get("발행주식수_출처", "")})
-    if out:  # 주식 종류가 여럿이면 대표 티커 가격 × 전체 주식수라 시가총액이 틀릴 수 있음 → 직접 확인용
-        others = {}
-        for c in EdgarClient(os.getenv("EDGAR_USER_AGENT", "")).tickers():
-            others.setdefault(c["cik"], []).append(c["ticker"])
-        for o in out:
-            o["같은 회사 다른 티커"] = " ".join(t for t in others.get(o["CIK"], []) if t != o["티커"]
-                                         and not PREFERRED_TICKER.search(t) and not NON_COMMON_TICKER.search(t))
+        t = p.pop("종목코드")
+        out.append({"CIK": r["CIK"], "티커": t, "회사명": p.pop("회사명"),
+                    "기간": r["기간"], "종료일": r["종료일"],
+                    "재무경과일": (as_of - date.fromisoformat(r["종료일"])).days,  # 기준일 − 분기 종료일
+                    **{k: v for k, v in p.items() if k != "기간"},
+                    "발행주식수": market[t]["shares"],
+                    "발행주식수_출처": "표지 종류별 합" if t in class_notes else r.get("발행주식수_출처", ""),
+                    "시가총액_계산": class_notes.get(t, ""),
+                    "같은 회사 다른 티커": " ".join(o for o in others.get(r["CIK"], []) if o != t)})
     save_csv(f"analysis/edgar/screen_{month}.csv", out, list(out[0]) if out else ["티커"])
 
 

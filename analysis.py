@@ -14,7 +14,7 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 
-BALANCE_KEYS = ("current_assets", "total_liabilities", "shares", "preferred", "minority")
+BALANCE_KEYS = ("current_assets", "total_liabilities", "shares", "preferred", "preferred_source", "minority")
 
 
 # ---------------------------------------------------------------- 공통 유틸
@@ -86,7 +86,7 @@ def _senior_claims(rec) -> dict:
     """
     if "end" not in rec:
         return {}
-    return {"우선주": rec.get("preferred"), "비지배지분": rec.get("minority")}
+    return {"우선주": rec.get("preferred"), "우선주_출처": rec.get("preferred_source"), "비지배지분": rec.get("minority")}
 
 
 def _senior_total(rec) -> float:
@@ -319,10 +319,13 @@ EDGAR_TAGS = {
     # 보통주보다 앞서는 몫 (순유동자산에서 뺌). 임시자본(상환우선주 등)은 총부채에도 자본에도 없음
     "temporary_equity": ["TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests",
                          "TemporaryEquityCarryingAmountAttributableToParent"],
-    # 자본 안의 우선주: 청산가치가 있으면 그 값, 없으면 장부가(액면만 적는 회사가 많아 작게 나올 수 있음)
-    "preferred_equity": ["PreferredStockLiquidationPreferenceValue", "PreferredStockValue"],
+    # 자본 안의 우선주: 청산가치 합계 → 주당 청산가치 × 우선주 주식수 → 장부가 순 (_preferred_total)
+    "preferred_liquidation": ["PreferredStockLiquidationPreferenceValue"],
+    "preferred_book": ["PreferredStockValue"],
     "minority": ["MinorityInterest"],
 }
+PREFERRED_PER_SHARE_TAGS = ["PreferredStockLiquidationPreference"]  # USD/shares
+PREFERRED_SHARES_TAGS = ["PreferredStockSharesOutstanding", "PreferredStockSharesIssued"]
 EDGAR_FLOW_UNITS = {"net_income": "USD", "buyback": "USD", "buyback_shares": "shares"}
 EDGAR_FORMS = {"10-K", "10-Q", "10-K/A", "10-Q/A"}
 FP_TO_Q = {"Q1": 1, "Q2": 2, "Q3": 3, "FY": 4}
@@ -428,6 +431,30 @@ def _fix_period_collisions(period_of_accn: dict, annual_report: set) -> dict:
     return out
 
 
+def _preferred_total(temporary, liquidation, book, per_share, shares):
+    """보통주보다 앞서는 우선주 몫과 출처. 반환: (금액 또는 None, 출처 설명)
+
+    임시자본(상환우선주 등) + 자본 안의 우선주. 자본 안의 우선주는 청산가치 합계가 있으면 그 값,
+    없으면 주당 청산가치 × 우선주 주식수와 장부가 중 큰 값 (장부가는 액면만 적는 회사가 많다: FBIO 장부가 $3,000,
+    주당 $25 × 343만 주 = $8,568만). 임시자본이 있으면 주식수가 임시자본 우선주까지 셀 수 있어 추정하지 않는다.
+    """
+    temporary = max(temporary, 0) if temporary is not None else None
+    equity, source = None, None
+    if liquidation is not None:
+        equity, source = max(liquidation, 0), "청산가치"
+    else:
+        estimate = (per_share * shares if temporary is None and per_share and shares
+                    and 0.01 <= per_share <= 100_000 and shares > 0 else None)
+        if estimate is not None and estimate > (book or 0):
+            equity, source = estimate, "주당청산가치×주식수"
+        elif book is not None:
+            equity, source = max(book, 0), "장부가"
+    parts = [(v, name) for v, name in ((temporary, "임시자본"), (equity, source)) if v is not None]
+    if not parts:
+        return None, None
+    return sum(v for v, _ in parts), " + ".join(name for v, name in parts if v > 0) or None
+
+
 def edgar_records(facts: dict):
     period_of_accn = edgar_periods(facts)
     periods = {end: (fy, q) for end, fy, q in period_of_accn.values()}
@@ -445,13 +472,17 @@ def edgar_records(facts: dict):
             out[(e.get("start"), e["end"])] = e["val"]
         return out
 
-    for key in ("current_assets", "total_liabilities", "temporary_equity", "preferred_equity", "minority"):
+    for key in ("current_assets", "total_liabilities", "temporary_equity", "preferred_liquidation", "preferred_book",
+                "minority"):
         values = {end: v for (_, end), v in latest(_edgar_entries(facts, "us-gaap", EDGAR_TAGS[key], "USD")).items()}
         for end in ends:
             quarters[periods[end]][key] = values.get(end)
+    per_share = {end: v for (_, end), v in latest(_edgar_entries(facts, "us-gaap", PREFERRED_PER_SHARE_TAGS, "USD/shares")).items()}
+    pref_shares = {end: v for (_, end), v in latest(_edgar_entries(facts, "us-gaap", PREFERRED_SHARES_TAGS, "shares")).items()}
     for rec in quarters.values():
-        parts = [max(v, 0) for v in (rec.pop("temporary_equity"), rec.pop("preferred_equity")) if v is not None]
-        rec["preferred"] = sum(parts) if parts else None
+        rec["preferred"], rec["preferred_source"] = _preferred_total(
+            rec.pop("temporary_equity"), rec.pop("preferred_liquidation"), rec.pop("preferred_book"),
+            per_share.get(rec["end"]), pref_shares.get(rec["end"]))
 
     for key, unit in EDGAR_FLOW_UNITS.items():
         values = latest(e for e in _edgar_entries(facts, "us-gaap", EDGAR_TAGS[key], unit) if "start" in e)
@@ -706,7 +737,7 @@ def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio:
         passed.append({
             "종목코드": code, "회사명": r["회사명"], ("기간" if quarterly else "연도"): period,
             "종가": m["close"], "시가총액": m["mktcap"],
-            "유동자산": ca, "총부채": tl, **({"우선주": preferred, "비지배지분": minority} if "우선주" in r else {}),
+            "유동자산": ca, "총부채": tl, **({"우선주": preferred, "우선주_출처": r.get("우선주_출처", ""), "비지배지분": minority} if "우선주" in r else {}),
             "순유동자산": ncav,
             "주당순유동자산": round(ncav / m["shares"], 2),
             "시총÷순유동자산": round(ratio, 3),
@@ -819,6 +850,42 @@ def xbrl_buyback_facts(xml_bytes: bytes) -> dict:
         facts.append({"start": start, "end": end, "tier": tier, "rank": rank,
                       "tag": local, "dims": dims, "val": val})
     return {"v": 3, "fy": fy, "period_end": period_end, "facts": facts, "treasury": treasury}
+
+
+def xbrl_cover_classes(xml_bytes: bytes) -> list[dict]:
+    """XBRL 표지(dei)의 주식 종류별 발행주식수와 티커. 반환: [{member, symbol, shares}]
+
+    companyfacts에는 차원(주식 종류) 없는 표지 값만 있어서 주식 종류가 여럿인 회사(HEI/HEI-A 등)는 한 종류만 잡히거나
+    아예 빠진다. 표지에는 종류(ClassOfStockAxis 등의 member)마다 EntityCommonStockSharesOutstanding과
+    TradingSymbol이 있다. member ""는 차원 없는 값. 티커가 없는 종류는 비상장 주식(예: 의결권 B주).
+    """
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_bytes)
+    contexts = {}
+    for c in root.iter(f"{XBRLI}context"):
+        period = c.find(f"{XBRLI}period")
+        end = period.findtext(f"{XBRLI}endDate") or period.findtext(f"{XBRLI}instant")
+        members = [(m.text or "").strip().split(":")[-1] for m in c.iter(f"{XBRLDI}explicitMember")]
+        contexts[c.get("id")] = (end and end.strip(), members)
+    shares, symbols = {}, {}
+    for el in root:
+        if not isinstance(el.tag, str) or "/dei/" not in el.tag or el.text is None:
+            continue
+        local = el.tag.split("}")[1]
+        end, members = contexts.get(el.get("contextRef"), (None, None))
+        if members is None or len(members) > 1:
+            continue
+        member = members[0] if members else ""
+        if local == "EntityCommonStockSharesOutstanding":
+            try:
+                val = float(el.text.strip())
+            except ValueError:
+                continue
+            if member not in shares or end > shares[member][0]:
+                shares[member] = (end, val)
+        elif local == "TradingSymbol" and el.text.strip():
+            symbols[member] = el.text.strip().upper()
+    return [{"member": m, "symbol": symbols.get(m), "shares": v} for m, (_, v) in sorted(shares.items())]
 
 
 def pick_buyback_shares(facts: list[dict], start: str, end: str):
