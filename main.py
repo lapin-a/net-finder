@@ -313,19 +313,19 @@ def fill_edgar_ends(edgar: EdgarClient, workers: int = 6) -> None:
 
 EDGAR_BALANCE_COLUMNS = {  # 지금 규칙으로 다시 계산하는 열: 앞 열 → 그 뒤에 둘 열
     "총부채": ["우선주", "우선주_출처", "비지배지분"],
-    "발행주식수": ["발행주식수_출처"],  # 분기표만
+    "발행주식수": ["발행주식수_출처", "발행주식수_기준일"],  # 분기표만
 }
 
 
 def fill_edgar_balance(edgar: EdgarClient, workers: int = 6) -> None:
     """글자별 일괄 결과(연간·분기)의 재무상태표 파생 열만 지금 규칙으로 다시 계산한다. 나머지 열(채운 자사주매입)은 그대로.
 
-    다시 계산하는 열: 우선주(·우선주_출처)·비지배지분, 발행주식수(분기표는 '발행주식수_출처'), 주당순유동자산.
+    다시 계산하는 열: 우선주(·우선주_출처)·비지배지분, 발행주식수(분기표는 '발행주식수_출처'·'발행주식수_기준일'), 주당순유동자산.
     - 발행주식수: 표지 값이 없는 분기는 3개월 가중평균, 둘 다 없으면 직전 값을 최대 3분기까지
     - 주당순유동자산 = (유동자산 − 총부채 − 우선주 − 비지배지분) ÷ 발행주식수
     """
     ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
-    redone = ["우선주", "우선주_출처", "비지배지분", "발행주식수", "발행주식수_출처", "주당순유동자산"]
+    redone = ["우선주", "우선주_출처", "비지배지분", "발행주식수", "발행주식수_출처", "발행주식수_기준일", "주당순유동자산"]
 
     def tables(cik):
         quarters, annual = analysis.edgar_records(edgar.company_facts(cik))
@@ -356,7 +356,7 @@ def fill_edgar_balance(edgar: EdgarClient, workers: int = 6) -> None:
                     elif k not in redone:
                         out[k] = v
                     for extra in EDGAR_BALANCE_COLUMNS.get(k, []):
-                        if extra != "발행주식수_출처" or which == 0:
+                        if not extra.startswith("발행주식수_") or which == 0:
                             out[extra] = new.get(extra)
                 rows[i] = out
         _save_edgar_quarterly(DATA_DIR / f"analysis/edgar/batch_{letter}_분기.csv", quarterly)
@@ -908,6 +908,45 @@ def _class_market_caps(edgar: EdgarClient, latest: dict, market: dict, close: di
     return notes
 
 
+def _split_adjust(latest: dict, market: dict, prices: list[dict], month: str) -> dict:
+    """주식수 기준일 이후 ~ 기준월 말 사이의 주식분할·병합을 주식수에 반영한다 (market을 고쳐 씀).
+
+    주식수는 분기 표지(기준일 = 표지 날짜, 보통 제출일 직전) 또는 가중평균(제출 전 분할까지 소급 반영 → 기준일 = 제출일) 값이고,
+    주가는 기준월 말 원래 종가라서 그 사이 병합이 있으면 시가총액이 병합 배율만큼 틀린다 (CREG 1:10 병합 → 10배).
+    Alpaca 분할배율 f = 원래 종가 ÷ 분할 반영 종가 (그 시점 이후 분할의 누적 배율). 보정 배율 = f(기준일) ÷ f(기준월 말).
+    기준일이 든 달 안에 분할이 있으면(전월과 f가 다름) 일봉으로 그날의 f를 구한다.
+    반환: {티커: 보정 설명}
+    """
+    factor = {(r["티커"], r["월"]): float(r["종가"]) / float(r["종가(분할반영)"])
+              for r in prices if r["종가"] and r["종가(분할반영)"] and float(r["종가(분할반영)"]) > 0}
+    alpaca = None
+    notes = {}
+    for t, r in latest.items():
+        d = r.get("발행주식수_기준일")
+        if t not in market or not d or (t, month) not in factor or (t, d[:7]) not in factor:
+            continue
+        f_day = factor[(t, d[:7])]
+        y, m = int(d[:4]), int(d[5:7])
+        prev = f"{y - (m == 1)}-{12 if m == 1 else m - 1:02d}"
+        if (t, prev) in factor and abs(factor[(t, prev)] / f_day - 1) > 0.01:
+            # 기준일이 든 달에 분할이 있음 → 일봉에서 기준일(휴장이면 직전 거래일)의 배율
+            alpaca = alpaca or AlpacaClient(os.getenv("ALPACA_KEY_ID", ""), os.getenv("ALPACA_SECRET_KEY", ""),
+                                            cache_dir=DATA_DIR / "cache/alpaca")
+            symbol = t.replace("-", ".")
+            last_day = (date(y + m // 12, m % 12 + 1, 1) - timedelta(days=1)).isoformat()
+            raw = {b["t"][:10]: b["c"] for b in alpaca.bars([symbol], f"{d[:7]}-01", last_day, "1Day", "raw").get(symbol, [])}
+            split = {b["t"][:10]: b["c"] for b in alpaca.bars([symbol], f"{d[:7]}-01", last_day, "1Day", "split").get(symbol, [])}
+            days = [k for k in sorted(raw) if k <= d and split.get(k)]
+            f_day = raw[days[-1]] / split[days[-1]] if days else factor[(t, prev)]
+        ratio = f_day / factor[(t, month)]
+        if abs(ratio - 1) <= 0.01:
+            continue
+        market[t] = {**market[t], "shares": market[t]["shares"] * ratio, "mktcap": market[t]["mktcap"] * ratio}
+        kind = "병합" if ratio < 1 else "분할"
+        notes[t] = f"{d} 이후 {kind} 반영: 주식수 ×{ratio:.4g}"
+    return notes
+
+
 def screen_edgar(args: list[str]) -> None:
     """미국 넷넷 스크리너. EDGAR 합친 결과 + Alpaca 월말 원래 종가. 옵션:
     [YYYY-MM]            주가 기준 월 (기본: 주가 파일의 최신 월)
@@ -963,11 +1002,12 @@ def screen_edgar(args: list[str]) -> None:
         if not PREFERRED_TICKER.search(c["ticker"]) and not NON_COMMON_TICKER.search(c["ticker"]):
             others.setdefault(c["cik"], []).append(c["ticker"])
     class_notes = _class_market_caps(edgar, latest, market, close, others, month)
+    split_notes = _split_adjust(latest, market, prices, month)
     max_ratio = float(opt("--ratio", 2 / 3))
     profit_years = int(opt("--profit-years", 3))
     print(f"주가 {month} 말 / 분기 종료일 {start} ~ {as_of - timedelta(days=lag)} / "
           f"가격 있는 종목 {len(close)}, 조건에 맞는 분기가 있는 회사 {len(latest)}, "
-          f"주식 종류별로 시가총액을 다시 계산한 회사 {len(class_notes)}")
+          f"주식 종류별로 시가총액을 다시 계산한 회사 {len(class_notes)}, 분할·병합 보정 {len(split_notes)}")
     passed, stages = analysis.screen_net_net(rows, "기준", market, max_ratio, profit_years,
                                              None if "--no-profit" in args else set(opt("--profit", "흑자,흑자전환").split(",")),
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
@@ -983,6 +1023,8 @@ def screen_edgar(args: list[str]) -> None:
                     **{k: v for k, v in p.items() if k != "기간"},
                     "발행주식수": market[t]["shares"],
                     "발행주식수_출처": "표지 종류별 합" if t in class_notes else r.get("발행주식수_출처", ""),
+                    "발행주식수_기준일": r.get("발행주식수_기준일", ""),
+                    "분할보정": split_notes.get(t, ""),
                     "시가총액_계산": class_notes.get(t, ""),
                     "같은 회사 다른 티커": " ".join(o for o in others.get(r["CIK"], []) if o != t)})
     save_csv(f"analysis/edgar/screen_{month}.csv", out, list(out[0]) if out else ["티커"])

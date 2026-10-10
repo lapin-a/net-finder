@@ -518,10 +518,14 @@ def edgar_records(facts: dict):
         end = period_of_accn[accn][0]
         quarters[periods[end]]["shares"] = by_date[max(by_date)]
         quarters[periods[end]]["shares_source"] = "표지"
+        quarters[periods[end]]["shares_date"] = max(by_date)  # 표지 기준일 (보통 제출일 직전)
     # 표지 값이 없는 분기(주식 종류별로만 적어 companyfacts에 안 잡히는 회사 등)는 그 분기 3개월 가중평균 주식수.
-    # 표지 값과 둘 다 있는 분기로 비교하면 75%가 ±2% 안
-    average = {e["end"]: e["val"] for e in _edgar_entries(facts, "us-gaap", ["WeightedAverageNumberOfSharesOutstandingBasic"], "shares")
-               if "start" in e and 80 <= _days(e) <= 100 and e["val"] > 0}
+    # 표지 값과 둘 다 있는 분기로 비교하면 75%가 ±2% 안.
+    # 가중평균은 제출 전에 있었던 분할·병합까지 소급 반영하므로 기준일은 제출일로 본다
+    average, average_filed = {}, {}
+    for e in _edgar_entries(facts, "us-gaap", ["WeightedAverageNumberOfSharesOutstandingBasic"], "shares"):
+        if "start" in e and 80 <= _days(e) <= 100 and e["val"] > 0:
+            average[e["end"]], average_filed[e["end"]] = e["val"], e["filed"]
     # 회사가 단위를 잘못 적은 값(TBLA 2,781억 주 등)은 시점이 가장 가까운 표지 값과 10배 넘게 다르면 버림
     cover = sorted((end, rec["shares"]) for end in ends if (rec := quarters[periods[end]]).get("shares_source") == "표지")
     for end in ends:
@@ -529,7 +533,7 @@ def edgar_records(facts: dict):
         if rec.get("shares") is None and end in average:
             near = min(cover, key=lambda c: abs((date.fromisoformat(c[0]) - date.fromisoformat(end)).days), default=None)
             if near is None or near[1] <= 0 or 0.1 <= average[end] / near[1] <= 10:
-                rec["shares"], rec["shares_source"] = average[end], "가중평균"
+                rec["shares"], rec["shares_source"], rec["shares_date"] = average[end], "가중평균", average_filed[end]
 
     for (year, q), rec in quarters.items():
         quarter_vals = [quarters.get((year, k), {}).get("buyback_shares") for k in range(1, q + 1)]
@@ -619,15 +623,15 @@ SHARES_CARRY_QUARTERS = 3  # 발행주식수가 없는 분기에 직전 값을 �
 
 
 def quarterly_table(quarters: dict) -> list[dict]:
-    rows, last_shares, last_source, carried = [], None, None, 0
+    rows, last_shares, last_source, last_date, carried = [], None, None, None, 0
     for year, q in sorted(quarters):
         rec = quarters[(year, q)]
         if rec.get("shares") is not None:
-            last_shares, last_source, carried = rec["shares"], rec.get("shares_source"), 0
+            last_shares, last_source, last_date, carried = rec["shares"], rec.get("shares_source"), rec.get("shares_date"), 0
         elif last_shares is not None:
             carried += 1
             if carried > SHARES_CARRY_QUARTERS:  # 공시가 끊긴 옛 값을 계속 쓰면 시가총액이 틀림
-                last_shares = last_source = None
+                last_shares = last_source = last_date = None
 
         def ttm(y, qq, key):
             vals = [quarters.get(_prev_quarter(y, qq, k), {}).get(key) for k in range(4)]
@@ -640,7 +644,8 @@ def quarterly_table(quarters: dict) -> list[dict]:
             "총부채": rec.get("total_liabilities"),
             **_senior_claims(rec),
             "발행주식수": last_shares,  # 해당 분기에 공시가 없으면 직전 값 사용 (최대 SHARES_CARRY_QUARTERS분기)
-            **({"발행주식수_출처": last_source and (last_source if not carried else f"{last_source}, {carried}분기 전")}
+            **({"발행주식수_출처": last_source and (last_source if not carried else f"{last_source}, {carried}분기 전"),
+                "발행주식수_기준일": last_date}  # 이 날짜 이후의 분할·병합은 반영 안 됨 (screen-edgar에서 보정)
                if "end" in rec else {}),  # EDGAR만
             "주당순유동자산": _ncav_per_share(rec.get("current_assets"), rec.get("total_liabilities"), last_shares,
                                          _senior_total(rec)),
