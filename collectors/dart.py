@@ -47,7 +47,15 @@ class DartClient:
             if cache.exists():
                 return json.loads(cache.read_text(encoding="utf-8"))
 
-        data = self._get(path, **params).json()
+        for attempt in range(4):
+            resp = self._get(path, **params)
+            try:
+                data = resp.json()
+                break
+            except ValueError:  # JSON이 아닌 응답 (점검·한도 안내 페이지 등) → 쉬었다가 다시
+                if attempt == 3:
+                    raise RuntimeError(f"DART 오류 비JSON: {resp.text[:200]!r}")
+                time.sleep(30 * (attempt + 1))
         # 000: 정상, 013: 조회된 데이터 없음
         if data.get("status") not in ("000", "013"):
             raise RuntimeError(f"DART 오류 {data.get('status')}: {data.get('message')}")

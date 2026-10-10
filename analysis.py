@@ -291,8 +291,8 @@ def fill_dart_annual_buyback(client, results: dict, years, progress=print) -> in
                            or client.financial_statements(corp, str(year), "11011", rec["fs_div"]))
                 treasury = client.treasury_stock(corp, str(year), "11011")
             except RuntimeError as e:
-                if "020" in str(e):
-                    progress(f"DART 일일 한도 도달: {year}년 {i - 1}/{len(targets)}에서 중단")
+                if "020" in str(e) or "비JSON" in str(e):
+                    progress(f"DART 일일 한도 또는 응답 오류({str(e)[:80]}): {year}년 {i - 1}/{len(targets)}에서 중단")
                     return done
                 raise
             amount = _dart_buyback_amount(fs_rows) if fs_rows else None
@@ -327,8 +327,8 @@ def fill_dart_quarterly_buyback(client, results: dict, years, progress=print) ->
                                or client.financial_statements(corp, str(year), reprt_code, "CFS"))
                     treasury = client.treasury_stock(corp, str(year), reprt_code)
                 except RuntimeError as e:
-                    if "020" in str(e):
-                        progress(f"DART 일일 한도 도달: {year}년 {q}분기 {i - 1}/{len(targets)}에서 중단")
+                    if "020" in str(e) or "비JSON" in str(e):
+                        progress(f"DART 일일 한도 또는 응답 오류({str(e)[:80]}): {year}년 {q}분기 {i - 1}/{len(targets)}에서 중단")
                         _dart_quarter_values(results)
                         return done
                     raise
