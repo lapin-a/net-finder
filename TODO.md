@@ -123,4 +123,4 @@
 
 - [x] 전체 검증 (2026-10-08): 계산식 재계산 불일치 0건, 삼성전자·애플 공시와 일치. 자사주매입 집계 버그 등 4건 수정 (`e31b4e0`)
 - [x] 로컬 폴더 이름 `new-folder` → `net-finder` (2026-10-09, `codyssey/net-finder`)
-  - OneDrive 밖으로 옮기는 것도 검토 (`data/cache` 2GB 넘음, 동기화 부담)
+  - OneDrive 밖으로 옮기는 것도 검토 (`data/cache` 약 5GB, 2026-10-10 기준: DART 4.7GB, EDGAR XBRL 157MB, Alpaca 100MB, KRX 42MB. 동기화 부담)
