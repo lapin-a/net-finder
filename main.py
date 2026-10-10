@@ -742,6 +742,61 @@ def estimate_edgar_buyback(max_share_ratio: float = 0.5) -> None:
         print(f"{kind} 합계: " + ", ".join(f"{k} {v:,}" for k, v in totals.items()), flush=True)
 
 
+def check_edgar_buyback_price(max_gap: float = 3) -> None:
+    """EDGAR 글자별 결과(연간·분기)의 자사주매입 주식수를 그 기간 평균 주가와 비교해, 평균 매입가가 max_gap배 넘게 어긋나면 비운다.
+
+    평균 매입가 = 매입 금액 ÷ 주식수. 평균 주가 = Alpaca 월봉 VWAP을 분할 반영(지금 기준)으로 바꾼 거래량 가중 평균
+    (연간 12개월 중 8개월 이상, 분기 3개월 중 2개월 이상). 회사가 나중 공시에서 주식수를 분할 반영 값으로 고쳐 적는 경우가 있어,
+    기간 시작 이후 지금까지의 분할배율(원래 ÷ 분할 반영 종가) 중 하나라도 맞으면 맞는 값으로 본다 (AAPL 2020: 기간 중 4:1 분할).
+    대상: companyfacts·XBRL 원문·자기주식 잔액 추정 값 (주가 추정·제외 칸은 빼고). 주가가 없는 기간(2016년 이전 등)은 그대로.
+    비운 칸 출처: '제외: <원래 출처> <주식수> (평균 매입가 $x, 평균 주가 $y)' → estimate-edgar-buyback이 다시 채울 수 있음.
+    """
+    num = analysis._num
+    adj_bars, factor = {}, {}
+    for r in _load_csv(DATA_DIR / "analysis/edgar/주가_월별.csv"):
+        close, adjusted = num(r["종가"]), num(r["종가(분할반영)"])
+        if not (close and adjusted and close > 0 and adjusted > 0):
+            continue
+        f = close / adjusted
+        factor.setdefault(r["티커"], {})[r["월"]] = f
+        if num(r["VWAP"]) and num(r["거래량"]):
+            adj_bars.setdefault(r["티커"], {})[r["월"]] = (num(r["VWAP"]) / f, num(r["거래량"]) * f)
+
+    specs = {  # 종류: (금액 열, 주식수 열, 출처 열, 개월, 최소 개월)
+        "연간": ("자사주매입", "자사주매입주식수", "자사주매입주식수_출처", 12, 8),
+        "분기": ("자사주매입(분기)", "자사주매입주식수(분기)", "자사주매입주식수(분기)_출처", 3, 2),
+    }
+    for kind, (amount_col, shares_col, src_col, months, min_months) in specs.items():
+        totals = Counter()
+        for path in _letter_paths(kind):
+            rows, stats = _load_csv(path), Counter()
+            for r in rows:
+                a, sh = num(r[amount_col]), num(r[shares_col])
+                source = r.get(src_col) or ("companyfacts" if r[shares_col] != "" else "")
+                if not (a and a > 0 and sh and sh > 0) or source.startswith((PRICE_ESTIMATE, "제외")) or not r["종료일"]:
+                    continue
+                end = date.fromisoformat(r["종료일"])
+                vwap, _ = analysis.period_vwap(adj_bars.get(r["티커"], {}), end, months, min_months)
+                if vwap is None:
+                    stats["주가 없음"] += 1
+                    continue
+                start = end - timedelta(days=months * 31)
+                fs = [f for m, f in factor.get(r["티커"], {}).items() if m >= f"{start.year}-{start.month:02d}"] or [1.0]
+                paid = a / sh
+                best = min(fs, key=lambda f: abs(math.log(paid / (vwap * f))))
+                if 1 / max_gap <= paid / (vwap * best) <= max_gap:
+                    stats["맞음"] += 1
+                    continue
+                r[shares_col] = ""
+                r[src_col] = f"제외: {source} {sh:g} (평균 매입가 ${paid:,.2f}, 평균 주가 ${vwap * best:,.2f})"
+                stats["비움"] += 1
+            if stats["비움"]:
+                (_save_edgar_annual if kind == "연간" else _save_edgar_quarterly)(path, rows)
+            totals += stats
+            print(f"{path.stem}: " + ", ".join(f"{k} {v}" for k, v in stats.items()), flush=True)
+        print(f"{kind} 합계: " + ", ".join(f"{k} {v:,}" for k, v in totals.items()), flush=True)
+
+
 def detect_splits() -> None:
     """일괄 분석 결과(분기표)의 발행주식수 변화로 주식분할·병합 후보를 찾는다. API 호출 없음."""
     def load(path):
@@ -1231,6 +1286,8 @@ def main(argv: list[str]) -> None:
         fix_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
     elif cmd == "estimate-edgar-buyback":
         estimate_edgar_buyback()
+    elif cmd == "check-edgar-buyback-price":
+        check_edgar_buyback_price()
     elif cmd == "refresh-edgar":
         refresh_edgar_tickers(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
     elif cmd == "fill-edgar-ends":

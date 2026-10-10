@@ -87,6 +87,8 @@ python main.py fix-edgar-buyback
 
 # 그래도 남은 자사주매입 주식수 빈칸(연간·분기)을 매입 금액 ÷ 기간 평균 주가(Alpaca VWAP)로 추정. us-prices 먼저
 python main.py estimate-edgar-buyback
+# 자사주매입 주식수를 기간 평균 주가(Alpaca VWAP, 분할 반영)와 비교해 평균 매입가가 3배 넘게 어긋나면 비움 → estimate-edgar-buyback 다시 실행
+python main.py check-edgar-buyback-price
 
 # 일부 회사만 다시 계산 (분석 코드 수정 후). 이후 fill-edgar-buyback 다시 실행
 python main.py refresh-edgar PRTH WTBA
