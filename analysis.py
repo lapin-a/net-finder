@@ -858,7 +858,7 @@ def xbrl_buyback_facts(xml_bytes: bytes) -> dict:
 
 
 def xbrl_cover_classes(xml_bytes: bytes) -> list[dict]:
-    """XBRL 표지(dei)의 주식 종류별 발행주식수와 티커. 반환: [{member, symbol, shares}]
+    """XBRL 표지(dei)의 주식 종류별 발행주식수와 티커. 반환: [{member, symbol, shares, date}] (date: 주식수 기준일)
 
     companyfacts에는 차원(주식 종류) 없는 표지 값만 있어서 주식 종류가 여럿인 회사(HEI/HEI-A 등)는 한 종류만 잡히거나
     아예 빠진다. 표지에는 종류(ClassOfStockAxis 등의 member)마다 EntityCommonStockSharesOutstanding과
@@ -890,7 +890,7 @@ def xbrl_cover_classes(xml_bytes: bytes) -> list[dict]:
                 shares[member] = (end, val)
         elif local == "TradingSymbol" and el.text.strip():
             symbols[member] = el.text.strip().upper()
-    return [{"member": m, "symbol": symbols.get(m), "shares": v} for m, (_, v) in sorted(shares.items())]
+    return [{"member": m, "symbol": symbols.get(m), "shares": v, "date": d} for m, (d, v) in sorted(shares.items())]
 
 
 def pick_buyback_shares(facts: list[dict], start: str, end: str):

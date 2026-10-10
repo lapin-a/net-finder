@@ -831,8 +831,8 @@ PREFERRED_TICKER = re.compile(r"-P[A-Z]?$")  # 우선주 티커 (JPM-PC 등)
 
 
 def _cover_classes(edgar: EdgarClient, cik: str, end: str) -> list[dict]:
-    """보고기간 종료일이 end인 10-Q·10-K 표지의 주식 종류별 발행주식수·티커 (data/cache/edgar_xbrl/cover_<CIK>_<종료일>.json)."""
-    cache = DATA_DIR / "cache/edgar_xbrl" / f"cover_{int(cik)}_{end}.json"
+    """보고기간 종료일이 end인 10-Q·10-K 표지의 주식 종류별 발행주식수·티커·기준일 (data/cache/edgar_xbrl/cover2_<CIK>_<종료일>.json)."""
+    cache = DATA_DIR / "cache/edgar_xbrl" / f"cover2_{int(cik)}_{end}.json"
     if cache.exists():
         return json.loads(cache.read_text(encoding="utf-8"))
     filings = [f for f in edgar.filings(cik, ("10-Q", "10-K", "10-Q/A", "10-K/A"), include_older=True) if f["reportDate"] == end]
@@ -849,16 +849,20 @@ def _cover_classes(edgar: EdgarClient, cik: str, end: str) -> list[dict]:
 
 
 def _class_market_caps(edgar: EdgarClient, latest: dict, market: dict, close: dict, others: dict, month: str) -> dict:
-    """주식 종류가 여럿인 회사(같은 CIK에 보통주 티커가 둘 이상)의 시가총액을 종류별 주식수 × 종류별 종가로 다시 계산한다.
-
-    대표 티커 가격 × 전체 주식수는 종류끼리 가격이 다르면 틀린다 (HEI-A는 HEI보다 싸고, BRK-A는 BRK-B의 1,500배).
-    순유동자산이 양수인 회사만 (나머지는 어차피 탈락). 티커가 없는 종류(비상장)는 대표 티커 가격으로 본다.
-    market을 고쳐 쓰고, 반환: {티커: 계산 설명}
+    """그 분기 10-Q·10-K 표지 XBRL의 종류별 주식수로 시가총액을 다시 계산한다. 대상 (순유동자산이 양수인 회사만):
+    - 주식 종류가 여럿인 회사(같은 CIK에 보통주 티커가 둘 이상): 종류별 주식수 × 종류별 종가.
+      대표 티커 가격 × 전체 주식수는 종류끼리 가격이 다르면 틀린다 (HEI-A는 HEI보다 싸고, BRK-A는 BRK-B의 1,500배).
+    - 주식수를 이전 분기에서 이어 쓴 회사: 표지를 Class A/B로 나눠 적으면 companyfacts에 안 잡혀 옛 값이 이어진다
+      (CTNT 10-K 3,618만 주 → 10-Q 표지 A 296만 + B 20만 주). 표지 종류별 합 × 대표 티커 종가.
+    티커가 없는 종류(비상장)는 대표 티커 가격으로 본다.
+    market을 고쳐 쓰고, 고친 회사의 latest 행에 발행주식수_기준일(표지 날짜)을 넣는다. 반환: {티커: 계산 설명}
     """
     num = analysis._num
     targets = {}
     for t, r in latest.items():
-        if t not in market or len(others.get(r["CIK"], [])) < 2:
+        multi = len(others.get(r["CIK"], [])) >= 2
+        carried = "분기 전" in (r.get("발행주식수_출처") or "")
+        if t not in market or not (multi or carried):
             continue
         ca, tl = num(r["유동자산"]), num(r["총부채"])
         if ca is None or tl is None or ca - tl - (num(r.get("우선주")) or 0) - max(num(r.get("비지배지분")) or 0, 0) <= 0:
@@ -867,7 +871,7 @@ def _class_market_caps(edgar: EdgarClient, latest: dict, market: dict, close: di
         classes = [c for c in _cover_classes(edgar, r["CIK"], r["종료일"]) if "Preferred" not in c["member"]
                    and not (c["symbol"] and (c["symbol"].endswith("P") and c["symbol"][:-1] == t
                                              or PREFERRED_TICKER.search(c["symbol"]) or NON_COMMON_TICKER.search(c["symbol"])))]
-        if len(classes) >= 2 and all(c["shares"] > 0 for c in classes):
+        if len(classes) >= (2 if not carried else 1) and all(c["shares"] > 0 for c in classes):
             targets[t] = classes
 
     sec_ticker = {o.replace("-", ""): o for os_ in others.values() for o in os_ if "-" in o}
@@ -904,7 +908,9 @@ def _class_market_caps(edgar: EdgarClient, latest: dict, market: dict, close: di
             mktcap += c["shares"] * price
             parts.append(f"{label} {c['shares']:,.0f}주×${price:,.2f}")
         market[t] = {"close": close[t], "shares": sum(c["shares"] for c in classes), "mktcap": mktcap}
-        notes[t] = "종류별: " + " + ".join(parts)
+        cover_date = max(c["date"] for c in classes)
+        notes[t] = f"표지 {cover_date}: " + " + ".join(parts)
+        latest[t]["발행주식수_기준일"] = cover_date
     return notes
 
 
