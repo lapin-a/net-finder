@@ -14,7 +14,7 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 
-BALANCE_KEYS = ("current_assets", "total_liabilities", "shares")
+BALANCE_KEYS = ("current_assets", "total_liabilities", "shares", "preferred", "minority")
 
 
 # ---------------------------------------------------------------- 공통 유틸
@@ -71,11 +71,26 @@ def _growth(current, previous):
     return round((current / previous - 1) * 100, 2)
 
 
-def _ncav_per_share(current_assets, total_liabilities, shares):
-    """(유동자산 - 총부채) / 발행주식수"""
+def _ncav_per_share(current_assets, total_liabilities, shares, senior=0):
+    """(유동자산 - 총부채 - senior) / 발행주식수. senior: 보통주보다 앞서는 몫 (EDGAR 우선주·비지배지분)"""
     if None in (current_assets, total_liabilities) or not shares:
         return None
-    return round((current_assets - total_liabilities) / shares, 2)
+    return round((current_assets - total_liabilities - senior) / shares, 2)
+
+
+def _senior_claims(rec) -> dict:
+    """EDGAR 분기·연간 record의 우선주·비지배지분 열. DART record(종료일 없음)는 빈 dict.
+
+    미국 우선주는 시가총액(보통주 종가 × 보통주 수)에 안 들어가고 총부채에도 없으므로 순유동자산에서 뺀다.
+    한국은 KRX 시가총액에 우선주가 들어 있어 빼지 않는다.
+    """
+    if "end" not in rec:
+        return {}
+    return {"우선주": rec.get("preferred"), "비지배지분": rec.get("minority")}
+
+
+def _senior_total(rec) -> float:
+    return (rec.get("preferred") or 0) + max(rec.get("minority") or 0, 0)
 
 
 def _prev_quarter(year, q, steps=1):
@@ -301,6 +316,12 @@ EDGAR_TAGS = {
     "buyback": ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"],
     "buyback_shares": ["StockRepurchasedDuringPeriodShares", "StockRepurchasedAndRetiredDuringPeriodShares",
                        "TreasuryStockSharesAcquired"],
+    # 보통주보다 앞서는 몫 (순유동자산에서 뺌). 임시자본(상환우선주 등)은 총부채에도 자본에도 없음
+    "temporary_equity": ["TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests",
+                         "TemporaryEquityCarryingAmountAttributableToParent"],
+    # 자본 안의 우선주: 청산가치가 있으면 그 값, 없으면 장부가(액면만 적는 회사가 많아 작게 나올 수 있음)
+    "preferred_equity": ["PreferredStockLiquidationPreferenceValue", "PreferredStockValue"],
+    "minority": ["MinorityInterest"],
 }
 EDGAR_FLOW_UNITS = {"net_income": "USD", "buyback": "USD", "buyback_shares": "shares"}
 EDGAR_FORMS = {"10-K", "10-Q", "10-K/A", "10-Q/A"}
@@ -424,10 +445,13 @@ def edgar_records(facts: dict):
             out[(e.get("start"), e["end"])] = e["val"]
         return out
 
-    for key in ("current_assets", "total_liabilities"):
+    for key in ("current_assets", "total_liabilities", "temporary_equity", "preferred_equity", "minority"):
         values = {end: v for (_, end), v in latest(_edgar_entries(facts, "us-gaap", EDGAR_TAGS[key], "USD")).items()}
         for end in ends:
             quarters[periods[end]][key] = values.get(end)
+    for rec in quarters.values():
+        parts = [max(v, 0) for v in (rec.pop("temporary_equity"), rec.pop("preferred_equity")) if v is not None]
+        rec["preferred"] = sum(parts) if parts else None
 
     for key, unit in EDGAR_FLOW_UNITS.items():
         values = latest(e for e in _edgar_entries(facts, "us-gaap", EDGAR_TAGS[key], unit) if "start" in e)
@@ -583,10 +607,12 @@ def quarterly_table(quarters: dict) -> list[dict]:
         row |= {
             "유동자산": rec.get("current_assets"),
             "총부채": rec.get("total_liabilities"),
+            **_senior_claims(rec),
             "발행주식수": last_shares,  # 해당 분기에 공시가 없으면 직전 값 사용 (최대 SHARES_CARRY_QUARTERS분기)
             **({"발행주식수_출처": last_source and (last_source if not carried else f"{last_source}, {carried}분기 전")}
                if "end" in rec else {}),  # EDGAR만
-            "주당순유동자산": _ncav_per_share(rec.get("current_assets"), rec.get("total_liabilities"), last_shares),
+            "주당순유동자산": _ncav_per_share(rec.get("current_assets"), rec.get("total_liabilities"), last_shares,
+                                         _senior_total(rec)),
             "순이익(분기)": rec.get("net_income"),
             "순이익(최근4분기)": ni_ttm,
         }
@@ -610,8 +636,10 @@ def annual_table(annual: dict) -> list[dict]:
         row |= {
             "유동자산": rec.get("current_assets"),
             "총부채": rec.get("total_liabilities"),
+            **_senior_claims(rec),
             "발행주식수": rec.get("shares"),
-            "주당순유동자산": _ncav_per_share(rec.get("current_assets"), rec.get("total_liabilities"), rec.get("shares")),
+            "주당순유동자산": _ncav_per_share(rec.get("current_assets"), rec.get("total_liabilities"), rec.get("shares"),
+                                         _senior_total(rec)),
             "순이익": rec.get("net_income"),
         }
         for n in CAGR_YEARS:
@@ -654,11 +682,14 @@ def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio:
     for code, r in current.items():
         stages["전체"] += 1
         ca, tl = _num(r["유동자산"]), _num(r["총부채"])
+        # EDGAR: 우선주·비지배지분도 보통주보다 앞서므로 뺌 (DART 행에는 이 열이 없음)
+        preferred, minority = _num(r.get("우선주")), _num(r.get("비지배지분"))
+        senior = (preferred or 0) + max(minority or 0, 0)
         m = market.get(code)
-        if ca is None or tl is None or ca - tl <= 0 or not m:
+        if ca is None or tl is None or ca - tl - senior <= 0 or not m:
             continue
         stages["순유동자산>0·주가있음"] += 1
-        ncav = ca - tl
+        ncav = ca - tl - senior
         ratio = m["mktcap"] / ncav
         if ratio > max_ratio:
             continue
@@ -675,7 +706,8 @@ def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio:
         passed.append({
             "종목코드": code, "회사명": r["회사명"], ("기간" if quarterly else "연도"): period,
             "종가": m["close"], "시가총액": m["mktcap"],
-            "유동자산": ca, "총부채": tl, "순유동자산": ncav,
+            "유동자산": ca, "총부채": tl, **({"우선주": preferred, "비지배지분": minority} if "우선주" in r else {}),
+            "순유동자산": ncav,
             "주당순유동자산": round(ncav / m["shares"], 2),
             "시총÷순유동자산": round(ratio, 3),
             "순이익": _num(r["순이익(최근4분기)" if quarterly else "순이익"]),

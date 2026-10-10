@@ -24,7 +24,7 @@
     python main.py estimate-edgar-buyback        # 그래도 남은 자사주매입 주식수 빈칸(연간·분기)을 금액 ÷ 기간 평균 주가로 추정
     python main.py refresh-edgar PRTH WTBA       # 일부 회사만 companyfacts로 다시 계산해 글자별 파일에 반영
     python main.py fill-edgar-ends               # 글자별 결과에 보고기간 종료일 열 추가 (값은 그대로)
-    python main.py fill-edgar-shares             # 글자별 결과의 발행주식수만 다시 계산 (표지 값 없으면 가중평균, 나머지 열은 그대로)
+    python main.py fill-edgar-balance            # 글자별 결과의 발행주식수·우선주·비지배지분·주당순유동자산만 다시 계산 (나머지 열은 그대로)
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
     python main.py us-prices                     # 미국 월별 주가 (Alpaca, 2016년부터) → edgar/주가_월별.csv
 
@@ -311,13 +311,21 @@ def fill_edgar_ends(edgar: EdgarClient, workers: int = 6) -> None:
         print(f"{letter}: 회사 {len(tickers)}곳, 종료일 못 찾은 행 {missing}", flush=True)
 
 
-def fill_edgar_shares(edgar: EdgarClient, workers: int = 6) -> None:
-    """글자별 일괄 결과(연간·분기)의 발행주식수·주당순유동자산만 지금 규칙으로 다시 계산한다. 나머지 열(채운 자사주매입)은 그대로.
+EDGAR_BALANCE_COLUMNS = {  # 지금 규칙으로 다시 계산하는 열: 앞 열 → 그 뒤에 둘 열
+    "총부채": ["우선주", "비지배지분"],
+    "발행주식수": ["발행주식수_출처"],  # 분기표만
+}
 
-    표지 값이 없는 분기는 3개월 가중평균 주식수로, 둘 다 없으면 직전 값을 최대 3분기까지 이어 쓴다.
-    분기표에는 '발행주식수_출처' 열(표지 / 가중평균 / '…, n분기 전')을 넣는다.
+
+def fill_edgar_balance(edgar: EdgarClient, workers: int = 6) -> None:
+    """글자별 일괄 결과(연간·분기)의 재무상태표 파생 열만 지금 규칙으로 다시 계산한다. 나머지 열(채운 자사주매입)은 그대로.
+
+    다시 계산하는 열: 우선주·비지배지분, 발행주식수(분기표는 '발행주식수_출처'), 주당순유동자산.
+    - 발행주식수: 표지 값이 없는 분기는 3개월 가중평균, 둘 다 없으면 직전 값을 최대 3분기까지
+    - 주당순유동자산 = (유동자산 − 총부채 − 우선주 − 비지배지분) ÷ 발행주식수
     """
     ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
+    redone = ["우선주", "비지배지분", "발행주식수", "발행주식수_출처", "주당순유동자산"]
 
     def tables(cik):
         quarters, annual = analysis.edgar_records(edgar.company_facts(cik))
@@ -335,17 +343,22 @@ def fill_edgar_shares(edgar: EdgarClient, workers: int = 6) -> None:
         for rows, which, key in ((quarterly, 0, "기간"), (annual, 1, "연도")):
             for i, r in enumerate(rows):
                 new = found.get(r["티커"], ({}, {}))[which].get(r[key])
-                if new is None:
+                if new is None:  # 지금 companyfacts에 없는 기간: 원래 값 유지
                     stats["못 찾은 행"] += 1
-                    new = {"발행주식수": r["발행주식수"], "발행주식수_출처": r.get("발행주식수_출처", ""),
-                           "주당순유동자산": r["주당순유동자산"]}
-                if str(new["발행주식수"] or "") != r["발행주식수"]:
-                    stats[f"{key} 주식수 바뀜"] += 1
-                r["발행주식수"], r["주당순유동자산"] = new["발행주식수"], new["주당순유동자산"]
-                if which == 0:
-                    head = list(r)[:list(r).index("발행주식수") + 1]
-                    rows[i] = {**{k: r[k] for k in head}, "발행주식수_출처": new.get("발행주식수_출처"),
-                               **{k: v for k, v in r.items() if k not in head and k != "발행주식수_출처"}}
+                    new = r
+                for col in ("발행주식수", "주당순유동자산"):
+                    if str(new.get(col) if new.get(col) is not None else "") != r.get(col, ""):
+                        stats[f"{key} {col} 바뀜"] += 1
+                out = {}
+                for k, v in r.items():  # 원래 열 순서를 따르고, 다시 계산한 열은 정해진 자리에 넣음
+                    if k in ("발행주식수", "주당순유동자산"):
+                        out[k] = new.get(k)
+                    elif k not in redone:
+                        out[k] = v
+                    for extra in EDGAR_BALANCE_COLUMNS.get(k, []):
+                        if extra != "발행주식수_출처" or which == 0:
+                            out[extra] = new.get(extra)
+                rows[i] = out
         _save_edgar_quarterly(DATA_DIR / f"analysis/edgar/batch_{letter}_분기.csv", quarterly)
         _save_edgar_annual(DATA_DIR / f"analysis/edgar/batch_{letter}_연간.csv", annual)
         totals += stats
@@ -813,6 +826,7 @@ def screen_dart(args: list[str]) -> None:
 
 # 보통주가 아닌 티커: 나스닥 5글자 W(워런트)·U(유닛)·R(권리), NYSE -WT·-U 등. 가격이 보통주와 달라 시가총액이 틀어진다
 NON_COMMON_TICKER = re.compile(r"^[A-Z]{4}[WUR]$|-(WT|WS|U|UN|R|RT)$")
+PREFERRED_TICKER = re.compile(r"-P[A-Z]?$")  # 우선주 티커 (JPM-PC 등)
 
 
 def screen_edgar(args: list[str]) -> None:
@@ -879,6 +893,13 @@ def screen_edgar(args: list[str]) -> None:
         out.append({"CIK": r["CIK"], "티커": p.pop("종목코드"), "회사명": p.pop("회사명"),
                     "기간": r["기간"], "종료일": r["종료일"], **{k: v for k, v in p.items() if k != "기간"},
                     "발행주식수": r["발행주식수"], "발행주식수_출처": r.get("발행주식수_출처", "")})
+    if out:  # 주식 종류가 여럿이면 대표 티커 가격 × 전체 주식수라 시가총액이 틀릴 수 있음 → 직접 확인용
+        others = {}
+        for c in EdgarClient(os.getenv("EDGAR_USER_AGENT", "")).tickers():
+            others.setdefault(c["cik"], []).append(c["ticker"])
+        for o in out:
+            o["같은 회사 다른 티커"] = " ".join(t for t in others.get(o["CIK"], []) if t != o["티커"]
+                                         and not PREFERRED_TICKER.search(t) and not NON_COMMON_TICKER.search(t))
     save_csv(f"analysis/edgar/screen_{month}.csv", out, list(out[0]) if out else ["티커"])
 
 
@@ -1054,8 +1075,8 @@ def main(argv: list[str]) -> None:
         refresh_edgar_tickers(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
     elif cmd == "fill-edgar-ends":
         fill_edgar_ends(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
-    elif cmd == "fill-edgar-shares":
-        fill_edgar_shares(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
+    elif cmd == "fill-edgar-balance":
+        fill_edgar_balance(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
     elif cmd == "merge-edgar":
         merge_edgar(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
 
