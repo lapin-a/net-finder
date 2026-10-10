@@ -914,6 +914,29 @@ def _class_market_caps(edgar: EdgarClient, latest: dict, market: dict, close: di
     return notes
 
 
+def _manual_shares(latest: dict, market: dict, close: dict, as_of: date) -> dict:
+    """manual_shares.csv(공시 본문으로 확인한 발행주식수)가 자동 값보다 최신이고 기준일 이전이면 그 값을 쓴다 (market을 고쳐 씀).
+
+    10-Q 표지 뒤에 8-K로만 알려진 대량 발행·병합(CTNT: 8월 ATM으로 병합 전 1.97억 주 발행 후 9/28 1:150 병합)은
+    자동 수집으로 못 잡는다. 시가총액 = 수동 주식수 × 대표 티커 종가. 고친 회사의 latest 행에 발행주식수_기준일을 넣는다.
+    반환: {티커: 설명}
+    """
+    path = DATA_DIR.parent / "manual_shares.csv"
+    if not path.exists():
+        return {}
+    notes = {}
+    for m in _load_csv(path):
+        t, d = m["티커"], m["기준일"]
+        r = latest.get(t)
+        if not r or t not in market or d > as_of.isoformat() or d <= (r.get("발행주식수_기준일") or ""):
+            continue
+        shares = float(m["발행주식수"])
+        market[t] = {"close": close[t], "shares": shares, "mktcap": shares * close[t]}
+        r["발행주식수_기준일"] = d
+        notes[t] = f"수동 {d}: {shares:,.0f}주×${close[t]:,.2f} ({m['출처']})"
+    return notes
+
+
 def _split_adjust(latest: dict, market: dict, prices: list[dict], month: str) -> dict:
     """주식수 기준일 이후 ~ 기준월 말 사이의 주식분할·병합을 주식수에 반영한다 (market을 고쳐 씀).
 
@@ -1008,12 +1031,15 @@ def screen_edgar(args: list[str]) -> None:
         if not PREFERRED_TICKER.search(c["ticker"]) and not NON_COMMON_TICKER.search(c["ticker"]):
             others.setdefault(c["cik"], []).append(c["ticker"])
     class_notes = _class_market_caps(edgar, latest, market, close, others, month)
+    manual_notes = _manual_shares(latest, market, close, as_of)
+    class_notes |= manual_notes
     split_notes = _split_adjust(latest, market, prices, month)
     max_ratio = float(opt("--ratio", 2 / 3))
     profit_years = int(opt("--profit-years", 3))
     print(f"주가 {month} 말 / 분기 종료일 {start} ~ {as_of - timedelta(days=lag)} / "
           f"가격 있는 종목 {len(close)}, 조건에 맞는 분기가 있는 회사 {len(latest)}, "
-          f"주식 종류별로 시가총액을 다시 계산한 회사 {len(class_notes)}, 분할·병합 보정 {len(split_notes)}")
+          f"주식 종류별로 시가총액을 다시 계산한 회사 {len(class_notes) - len(manual_notes)}, 수동 주식수 {len(manual_notes)}, "
+          f"분할·병합 보정 {len(split_notes)}")
     passed, stages = analysis.screen_net_net(rows, "기준", market, max_ratio, profit_years,
                                              None if "--no-profit" in args else set(opt("--profit", "흑자,흑자전환").split(",")),
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
@@ -1028,7 +1054,8 @@ def screen_edgar(args: list[str]) -> None:
                     "재무경과일": (as_of - date.fromisoformat(r["종료일"])).days,  # 기준일 − 분기 종료일
                     **{k: v for k, v in p.items() if k != "기간"},
                     "발행주식수": market[t]["shares"],
-                    "발행주식수_출처": "표지 종류별 합" if t in class_notes else r.get("발행주식수_출처", ""),
+                    "발행주식수_출처": ("수동" if t in manual_notes else "표지 종류별 합") if t in class_notes
+                                       else r.get("발행주식수_출처", ""),
                     "발행주식수_기준일": r.get("발행주식수_기준일", ""),
                     "분할보정": split_notes.get(t, ""),
                     "시가총액_계산": class_notes.get(t, ""),
