@@ -48,6 +48,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 
 import analysis
@@ -248,17 +249,30 @@ def refresh_edgar_tickers(edgar: EdgarClient, tickers: list[str], workers: int =
     분석 코드를 고친 뒤 일부 회사만 다시 계산할 때 사용. 연간표의 XBRL 보충값은 지워지므로 fill-edgar-buyback을 다시 실행.
     """
     ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
+    merged = DATA_DIR / "analysis/edgar/분기.csv"  # SEC 티커 목록에서 빠진 회사(상장 폐지 등)는 합친 표의 CIK
+    if merged.exists():
+        for r in _load_csv(merged):
+            if r["CIK"]:
+                ciks.setdefault(r["티커"], r["CIK"])
     by_letter = {}
     for ticker in (t.upper() for t in tickers):
+        if ticker not in ciks:
+            print(f"{ticker}: CIK를 찾을 수 없어 건너뜀")
+            continue
         by_letter.setdefault(ticker[0], []).append(ticker)
 
     def tables(ticker):
-        quarters, annual = analysis.edgar_records(edgar.company_facts(ciks[ticker]))
+        try:
+            quarters, annual = analysis.edgar_records(edgar.company_facts(ciks[ticker]))
+        except requests.HTTPError as e:  # companyfacts가 없어진 회사
+            print(f"{ticker}: companyfacts 못 받음 ({e.response.status_code}), 건너뜀")
+            return None
         return {"분기": analysis.quarterly_table(quarters), "연간": analysis.annual_table(annual)}
 
     for letter, group in sorted(by_letter.items()):
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            computed = dict(zip(group, pool.map(tables, group)))
+            computed = {t: v for t, v in zip(group, pool.map(tables, group)) if v is not None}
+        group = [t for t in group if t in computed]
         for kind in ("분기", "연간"):
             path = DATA_DIR / f"analysis/edgar/batch_{letter}_{kind}.csv"
             rows = _load_csv(path)
@@ -421,7 +435,8 @@ def _search_quarter_buyback(edgar: EdgarClient, cik: str, gaps: set, no_buyback:
     return found, searched
 
 
-def fill_edgar_buyback_quarterly(edgar: EdgarClient, letters: list[str], workers: int = 6) -> None:
+def fill_edgar_buyback_quarterly(edgar: EdgarClient, letters: list[str], workers: int = 6,
+                                 only: set[str] | None = None) -> None:
     """EDGAR 일괄 분기표에서 자사주매입 금액은 있는데 주식수가 비었거나 0주인 칸을 10-Q·10-K XBRL 원문으로 채운다.
 
     채운 뒤 연초누적과 전년 동기 대비를 다시 계산한다. 출처는 '자사주매입주식수(분기)_출처' 열.
@@ -447,7 +462,7 @@ def fill_edgar_buyback_quarterly(edgar: EdgarClient, letters: list[str], workers
                 gaps.setdefault(r["티커"], set()).add((fy, q))
 
         filled = searched = rejected = failed = 0
-        jobs = [(t, ciks[t], g) for t, g in gaps.items() if t in ciks]
+        jobs = [(t, ciks[t], g) for t, g in gaps.items() if t in ciks and (only is None or t in only)]
         by_key = {(r["티커"], r["기간"]): r for r in rows}
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_search_quarter_buyback, edgar, cik, g, no_buyback.get(t, set())) for t, cik, g in jobs]
@@ -582,7 +597,8 @@ def merge_edgar(edgar: EdgarClient) -> None:
         print(f"{kind}: 회사 {len(by_company)}곳, 같은 회사의 다른 티커 {len(dropped)}개 제외: {', '.join(sorted(dropped))}")
 
 
-def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6, recheck: bool = False) -> None:
+def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6, recheck: bool = False,
+                       only: set[str] | None = None) -> None:
     """EDGAR 일괄 연간표에서 자사주매입 금액은 있는데 주식수가 빈 칸을 10-K XBRL 원문으로 채운다.
 
     10-K 자본변동표에는 3개년이 들어 있으므로 최신 10-K부터 거꾸로 내려가며, 빈 연도가 다 채워지거나
@@ -610,7 +626,8 @@ def fill_edgar_buyback(edgar: EdgarClient, letters: list[str], workers: int = 6,
                 rechecks[(r["티커"], int(r["연도"]))] = r
 
         filled = searched = rejected = estimated = changed = cleared = 0
-        jobs = [(ticker, ciks[ticker], years) for ticker, years in gaps.items() if ticker in ciks]
+        jobs = [(ticker, ciks[ticker], years) for ticker, years in gaps.items()
+                if ticker in ciks and (only is None or ticker in only)]
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_search_10k_buyback, edgar, cik, years) for _, cik, years in jobs]
             for i, ((ticker, _, _), future) in enumerate(zip(jobs, futures), 1):
@@ -708,6 +725,15 @@ def estimate_edgar_buyback(max_share_ratio: float = 0.5) -> None:
                         and not r[src_col].startswith(("추정", "제외"))):
                     price[(r["티커"], index(r))] = a / s
 
+            # 분기는 주가가 없으면(2016년 이전 등) 같은 회계연도의 연간 실제 평균 매입가로 나눈다
+            annual_price = {}
+            if kind == "분기":
+                for ar in _load_csv(path.with_name(path.name.replace("_분기", "_연간"))):
+                    a2, s2 = num(ar["자사주매입"]), num(ar["자사주매입주식수"])
+                    if (a2 and a2 > 0 and s2 and s2 > 0 and lo <= a2 / s2 <= hi
+                            and not (ar.get("자사주매입주식수_출처") or "").startswith(("추정", "제외", PRICE_ESTIMATE))):
+                        annual_price[(ar["티커"], int(ar["연도"]))] = a2 / s2
+
             stats = Counter()
             for r in rows:
                 a, s, source = num(r[amount_col]), num(r[shares_col]), r[src_col]
@@ -717,6 +743,11 @@ def estimate_edgar_buyback(max_share_ratio: float = 0.5) -> None:
                 stats["대상"] += 1
                 vwap, n = (analysis.period_vwap(bars[r["티커"]], date.fromisoformat(r["종료일"]), months, min_months)
                            if r["티커"] in bars and r["종료일"] else (None, 0))
+                label = f"{PRICE_ESTIMATE}: VWAP ${vwap:.2f}, {n}개월" if vwap else ""
+                if vwap is None and (r["티커"], int(r["기간"][:4]) if kind == "분기" else 0) in annual_price:
+                    vwap = annual_price[(r["티커"], int(r["기간"][:4]))]
+                    label = f"{PRICE_ESTIMATE}(연간 평균 매입가): ${vwap:.2f}"
+                    stats["연간 평균 매입가 사용"] += 1
                 if vwap is None:
                     stats["주가 없음"] += 1
                     continue
@@ -730,7 +761,7 @@ def estimate_edgar_buyback(max_share_ratio: float = 0.5) -> None:
                     stats["인접 매입가와 불일치"] += 1
                 else:
                     r[shares_col] = shares
-                    r[src_col] = f"{PRICE_ESTIMATE}: VWAP ${vwap:.2f}, {n}개월 / 이전: {source}"
+                    r[src_col] = f"{label} / 이전: {source}"
                     stats["채움"] += 1
 
             if kind == "연간":
@@ -819,6 +850,133 @@ def detect_splits() -> None:
             before, after = source.get((f["티커"], f["이전기간"])), source.get((f["티커"], f["이후기간"]))
             f["주식수출처"] = before if before == after else f"{before}→{after}"
         save_csv("analysis/splits_edgar.csv", found, ["티커", "회사명"] + out_fields + ["주식수출처"])
+
+
+def _split_ratio(text: str) -> float:
+    """'10:1' → 10, '1:4' → 0.25, '1.5:1' → 1.5 (분할 후 주식수 ÷ 분할 전)."""
+    a, b = text.split(":")
+    return float(a) / float(b)
+
+
+def adjust_splits() -> None:
+    """과거 발행주식수·주당순유동자산을 지금 주식 기준(분할 반영)으로 바꾼 열을 더한다. 원래 열은 그대로.
+
+    한국: detect-splits 후보(splits_dart.csv)를 KRX 분기 말 종가·시가총액으로 검증. 분할·무상증자면 종가가 배율의 반대로 움직이고
+      (종가 비 × 배율이 1/1.6~1.6) 시가총액은 거의 그대로(1/1.6~1.6). 유상증자·합병은 시가총액이 같이 늘어 빠진다.
+      검증 결과: data/analysis/splits_dart_검증.csv. 배율 = 그 기간 뒤 검증된 분할 배율의 곱.
+    미국: Alpaca 분할배율 f(월) = 원래 ÷ 분할 반영 종가 (그 달 이후 분할의 누적). 배율 = f(발행주식수_기준일이 든 달).
+      2016년 이전은 주가가 없어 2016년 1월의 f × 그 사이 detect-splits 탐지 배율(주가 검증 없음) (`분할반영_범위` 열).
+    대상: dart/batch_상장사_{분기,연간}.csv, edgar/{분기,연간}.csv. analyze-dart-batch·merge-edgar 뒤에 다시 실행해야 한다.
+    """
+    num = analysis._num
+
+    def add_columns(rows, ratio_of, scope_of=None):
+        for r in rows:
+            k = ratio_of(r)
+            shares, ncav = num(r.get("발행주식수")), num(r.get("주당순유동자산"))
+            r["분할반영_배율"] = round(k, 6) if k is not None else ""
+            r["발행주식수(분할반영)"] = round(shares * k) if shares is not None and k else ""
+            r["주당순유동자산(분할반영)"] = round(ncav / k, 4) if ncav is not None and k else ""
+            if scope_of:
+                r["분할반영_범위"] = scope_of(r) if k is not None else ""
+        return rows
+
+    def save(path, rows):
+        extra = ["분할반영_배율", "발행주식수(분할반영)", "주당순유동자산(분할반영)", "분할반영_범위"]
+        fields = [k for k in rows[0] if k not in extra] + [k for k in extra if k in rows[0]]
+        save_csv(str(path.relative_to(DATA_DIR)).replace("\\", "/"), rows, fields)
+
+    # ---- 한국
+    dart_q, dart_a = DATA_DIR / "analysis/dart/batch_상장사_분기.csv", DATA_DIR / "analysis/dart/batch_상장사_연간.csv"
+    cands = _load_csv(DATA_DIR / "analysis/splits_dart.csv")
+    krx = KrxClient(os.getenv("KRX_API_KEY", ""), cache_dir=DATA_DIR / "cache/krx")
+    market = {}
+
+    def at(period):
+        if period not in market:
+            y, q = int(period[:4]), int(period[-1])
+            market[period] = krx.market_data(date(y, *QUARTER_ENDS[q]))[1]
+        return market[period]
+
+    verified, checked = {}, []
+    for c in cands:
+        ratio = _split_ratio(c["배율"])
+        before, after = at(c["이전기간"]).get(c["종목코드"]), at(c["이후기간"]).get(c["종목코드"])
+        if not before or not after or not before["close"] or not before["mktcap"]:
+            verdict = "주가 없음"
+        else:
+            price_fit = after["close"] / before["close"] * ratio
+            cap_fit = after["mktcap"] / before["mktcap"]
+            ok = 1 / 1.6 <= price_fit <= 1.6 and 1 / 1.6 <= cap_fit <= 1.6
+            verdict = "분할" if ok else "아님"
+            c |= {"종가비×배율": round(price_fit, 3), "시가총액비": round(cap_fit, 3)}
+            if ok:
+                verified.setdefault(c["종목코드"], []).append((c["이후기간"], ratio))
+        c["판정"] = verdict
+        checked.append(c)
+    save_csv("analysis/splits_dart_검증.csv", checked, list(cands[0]) + ["종가비×배율", "시가총액비", "판정"])
+
+    def dart_ratio(period_key):
+        def f(r):
+            p = r[period_key] if period_key == "기간" else f"{r['연도']}Q4"
+            k = 1.0
+            for after, ratio in verified.get(r["종목코드"], []):
+                if after > p:
+                    k *= ratio
+            return k
+        return f
+
+    for path, key in ((dart_q, "기간"), (dart_a, "연도")):
+        if path.exists():
+            save(path, add_columns(_load_csv(path), dart_ratio(key)))
+    print(f"한국 분할 후보 {len(cands)}건 → 분할 {sum(len(v) for v in verified.values())}건 ({len(verified)}개 회사), "
+          f"아님 {sum(c['판정'] == '아님' for c in checked)}, 주가 없음 {sum(c['판정'] == '주가 없음' for c in checked)}")
+
+    # ---- 미국
+    factor = {}
+    for r in _load_csv(DATA_DIR / "analysis/edgar/주가_월별.csv"):
+        close, adjusted = num(r["종가"]), num(r["종가(분할반영)"])
+        if close and adjusted and close > 0 and adjusted > 0:
+            factor.setdefault(r["티커"], {})[r["월"]] = close / adjusted
+    first = {t: fs[min(fs)] for t, fs in factor.items()}
+    eq, ea = DATA_DIR / "analysis/edgar/분기.csv", DATA_DIR / "analysis/edgar/연간.csv"
+    q_rows = _load_csv(eq)
+    basis = {(r["티커"], r["기간"]): r.get("발행주식수_기준일") or r["종료일"] for r in q_rows}
+    # 2016년 이전(주가 없음)은 detect-splits 탐지값을 쓴다 (주식수가 정수배로 바뀐 지점, 주식수 출처가 같은 경우만. 주가 검증 없음)
+    early = {}
+    for c in _load_csv(DATA_DIR / "analysis/splits_edgar.csv"):
+        after = basis.get((c["티커"], c["이후기간"]), "")
+        fs = factor.get(c["티커"])
+        if after and "→" not in c.get("주식수출처", "") and (not fs or after[:7] < min(fs)):
+            early.setdefault(c["티커"], []).append((after, _split_ratio(c["배율"])))
+
+    def us_date(r):
+        return (basis.get((r["티커"], r["기간"])) if "기간" in r else basis.get((r["티커"], f"{r['연도']}Q4"))) or r.get("종료일") or ""
+
+    def us_ratio(r):
+        d, fs = us_date(r), factor.get(r["티커"])
+        if not d or not fs:
+            return None
+        if d[:7] >= min(fs):
+            return fs.get(d[:7])
+        k = first[r["티커"]]
+        for after, ratio in early.get(r["티커"], []):
+            if after > d:
+                k *= ratio
+        return k
+
+    def us_scope(r):
+        fs = factor.get(r["티커"], {})
+        if not fs or us_date(r)[:7] >= min(fs):
+            return "전체"
+        return "2016년 이전은 탐지값(주가 검증 없음)" if early.get(r["티커"]) else "2016년 이후 분할만"
+
+    save(eq, add_columns(q_rows, us_ratio, us_scope))
+    a_rows = _load_csv(ea)
+    save(ea, add_columns(a_rows, us_ratio, us_scope))
+    changed = sum(1 for r in q_rows if r["분할반영_배율"] not in ("", 1, 1.0))
+    print(f"미국 분기 {len(q_rows):,}행 중 배율 1이 아닌 행 {changed:,}, 배율 없음(주가 없는 티커) "
+          f"{sum(1 for r in q_rows if r['분할반영_배율'] == ''):,}")
 
 
 def screen_dart(args: list[str]) -> None:
@@ -1205,7 +1363,8 @@ def _listed_corps(dart: DartClient) -> list[dict]:
     return corps
 
 
-def analyze_dart_batch(dart: DartClient, start: int, end: int, buyback_years: list[int] = ()) -> None:
+def analyze_dart_batch(dart: DartClient, start: int, end: int, buyback_years: list[int] = (),
+                       quarterly_buyback_years: list[int] = ()) -> None:
     """종목코드가 있는 회사 전체의 유동자산·총부채·순이익을 통합 CSV로 저장."""
     corps = {c["corp_code"]: c for c in _listed_corps(dart)}
     print(f"대상 회사: {len(corps)}", flush=True)
@@ -1221,6 +1380,10 @@ def analyze_dart_batch(dart: DartClient, start: int, end: int, buyback_years: li
         cached = DartClient(dart.api_key, cache_dir=DATA_DIR / "cache/dart_single")
         analysis.fill_dart_annual_buyback(cached, results, buyback_years,
                                           progress=lambda msg: print(msg, flush=True))
+    if quarterly_buyback_years:
+        cached = DartClient(dart.api_key, cache_dir=DATA_DIR / "cache/dart_single")
+        analysis.fill_dart_quarterly_buyback(cached, results, quarterly_buyback_years,
+                                             progress=lambda msg: print(msg, flush=True))
 
     q_all, a_all = [], []
     for corp_code, (quarters, annual) in sorted(results.items(), key=lambda x: corps[x[0]]["stock_code"]):
@@ -1276,12 +1439,22 @@ def main(argv: list[str]) -> None:
 
     elif cmd == "detect-splits":
         detect_splits()
+    elif cmd == "adjust-splits":
+        adjust_splits()
 
-    elif cmd == "fill-edgar-buyback":
-        fill_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), [a for a in args if a != "--recheck"],
-                           recheck="--recheck" in args)
-    elif cmd == "fill-edgar-buyback-quarterly":
-        fill_edgar_buyback_quarterly(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args)
+    elif cmd in ("fill-edgar-buyback", "fill-edgar-buyback-quarterly"):
+        # --tickers-file <파일>: 공백으로 구분한 티커만 다시 찾음 (refresh-edgar로 다시 계산한 회사 등)
+        only = None
+        if "--tickers-file" in args:
+            i = args.index("--tickers-file")
+            only = set(Path(args[i + 1]).read_text(encoding="utf-8").split())
+            args = args[:i] + args[i + 2:]
+        letters = [a for a in args if a != "--recheck"]
+        if cmd == "fill-edgar-buyback":
+            fill_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), letters, recheck="--recheck" in args,
+                               only=only)
+        else:
+            fill_edgar_buyback_quarterly(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), letters, only=only)
     elif cmd == "fix-edgar-buyback":
         fix_edgar_buyback(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
     elif cmd == "estimate-edgar-buyback":
@@ -1307,9 +1480,15 @@ def main(argv: list[str]) -> None:
         screen_dart(args)
 
     elif cmd == "analyze-dart-batch":
-        # 예: analyze-dart-batch 2015 2025 --buyback 2025 2024  (자사주매입은 적힌 연도 순서대로 수집)
-        buyback_years = [int(y) for y in args[args.index("--buyback") + 1:]] if "--buyback" in args else []
-        analyze_dart_batch(DartClient(os.getenv("DART_API_KEY", "")), int(args[0]), int(args[1]), buyback_years)
+        # 예: analyze-dart-batch 2015 2025 --buyback 2025 2024 --buyback-quarterly 2026 2025
+        # (자사주매입은 적힌 연도 순서대로 수집. 분기는 1분기·반기·3분기 보고서, 4분기는 연간 − 3분기 누적)
+        def years_after(flag):
+            if flag not in args:
+                return []
+            rest = args[args.index(flag) + 1:]
+            return [int(y) for y in rest[:next((i for i, a in enumerate(rest) if a.startswith("--")), len(rest))]]
+        analyze_dart_batch(DartClient(os.getenv("DART_API_KEY", "")), int(args[0]), int(args[1]),
+                           years_after("--buyback"), years_after("--buyback-quarterly"))
 
     elif cmd == "analyze-edgar-batch":
         analyze_edgar_batch(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args[0])

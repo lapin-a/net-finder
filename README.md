@@ -69,6 +69,8 @@ python main.py analyze-dart-batch 2015 2026
 
 # + 연간 자사주매입 (회사별 호출, 연도당 약 5,500건). 적힌 연도 순서대로 수집
 python main.py analyze-dart-batch 2015 2026 --buyback 2025 2024
+# + 분기 자사주매입 (1분기·반기·3분기 보고서, 연도당 약 16,000건). 일일 한도에 걸리면 멈추고, 다시 실행하면 이어서 받음
+python main.py analyze-dart-batch 2015 2026 --buyback 2025 … 2015 --buyback-quarterly 2026 2025 … 2016
 
 # 미국: 티커가 A로 시작하는 회사 전체
 python main.py analyze-edgar-batch A
@@ -89,6 +91,10 @@ python main.py fix-edgar-buyback
 python main.py estimate-edgar-buyback
 # 자사주매입 주식수를 기간 평균 주가(Alpaca VWAP, 분할 반영)와 비교해 평균 매입가가 3배 넘게 어긋나면 비움 → estimate-edgar-buyback 다시 실행
 python main.py check-edgar-buyback-price
+# 과거 발행주식수·주당순유동자산을 지금 주식 기준으로 바꾼 열 추가 (한국: KRX로 검증한 분할, 미국: Alpaca 분할배율)
+# analyze-dart-batch·merge-edgar 뒤에 다시 실행
+python main.py adjust-splits
+# fill-edgar-buyback·fill-edgar-buyback-quarterly는 --tickers-file <파일>로 일부 회사만 다시 찾을 수 있음
 
 # 일부 회사만 다시 계산 (분석 코드 수정 후). 이후 fill-edgar-buyback 다시 실행
 python main.py refresh-edgar PRTH WTBA

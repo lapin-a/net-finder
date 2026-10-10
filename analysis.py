@@ -307,6 +307,56 @@ def fill_dart_annual_buyback(client, results: dict, years, progress=print) -> in
     return done
 
 
+DART_QUARTER_REPORTS = [("11013", 1), ("11012", 2), ("11014", 3)]  # 1분기·반기·3분기 보고서
+
+
+def fill_dart_quarterly_buyback(client, results: dict, years, progress=print) -> int:
+    """1분기·반기·3분기 보고서의 자사주매입(금액·주식수, 연초부터 누적)을 회사별로 받아 분기 값으로 바꿔 results에 채운다.
+
+    분기 값 = 이번 누적 − 직전 분기 누적 (1분기는 누적 그대로, 4분기는 사업보고서 연간값 − 3분기 누적).
+    회사당 보고서마다 2건 호출(별도재무제표 + 자기주식 현황) → 연도당 약 2,800개 회사 × 3개 보고서 × 2건.
+    years 순서대로 처리하고, DART 일일 한도(오류 020)에 걸리면 거기서 멈춘다 (받은 것은 캐시되어 다시 실행하면 이어짐).
+    """
+    done = 0
+    for year in years:
+        for reprt_code, q in DART_QUARTER_REPORTS:
+            targets = [(corp, quarters[(year, q)]) for corp, (quarters, _) in results.items() if (year, q) in quarters]
+            for i, (corp, rec) in enumerate(targets, 1):
+                try:
+                    fs_rows = (client.financial_statements(corp, str(year), reprt_code, "OFS")
+                               or client.financial_statements(corp, str(year), reprt_code, "CFS"))
+                    treasury = client.treasury_stock(corp, str(year), reprt_code)
+                except RuntimeError as e:
+                    if "020" in str(e):
+                        progress(f"DART 일일 한도 도달: {year}년 {q}분기 {i - 1}/{len(targets)}에서 중단")
+                        _dart_quarter_values(results)
+                        return done
+                    raise
+                amount = _dart_buyback_amount(fs_rows) if fs_rows else None
+                rec["buyback_ytd"] = amount
+                rec["buyback_shares_ytd"] = _dart_buyback_shares(treasury, amount) if amount is not None else None
+                done += 1
+                if i % 500 == 0:
+                    progress(f"{year} {q}분기 자사주매입 {i}/{len(targets)}")
+            progress(f"{year} {q}분기 자사주매입 완료 ({len(targets)}개 회사)")
+    _dart_quarter_values(results)
+    return done
+
+
+def _dart_quarter_values(results: dict) -> None:
+    """누적(buyback_ytd·buyback_shares_ytd) → 분기 값(buyback·buyback_shares). 4분기는 연간값 − 3분기 누적."""
+    for quarters, annual in results.values():
+        for (year, q), rec in quarters.items():
+            if q == 4:
+                a = annual.get(year, {})
+                rec["buyback_ytd"], rec["buyback_shares_ytd"] = a.get("buyback"), a.get("buyback_shares")
+        for (year, q), rec in quarters.items():
+            prev = quarters.get((year, q - 1), {}) if q > 1 else {}
+            for ytd_key, key in (("buyback_ytd", "buyback"), ("buyback_shares_ytd", "buyback_shares")):
+                cur = rec.get(ytd_key)
+                rec[key] = cur if q == 1 or cur is None else _sub(cur, prev.get(ytd_key))
+
+
 # ---------------------------------------------------------------- EDGAR
 
 EDGAR_TAGS = {
@@ -362,7 +412,47 @@ def edgar_periods(facts: dict) -> dict:
     for accn, (end, fy, q) in period_of_accn.items():
         if not fy or abs(fy - int(end[:4])) > 1:
             period_of_accn[accn] = (end, int(end[:4]) + offset, q)
-    return _fix_period_collisions(period_of_accn, annual_report)
+    fixed = _fix_period_collisions(period_of_accn, annual_report)
+    return _relabel_if_disordered(fixed, annual_report)
+
+
+def _disorder(period_of_accn: dict) -> int:
+    """(회계연도, 분기) 순서와 종료일 순서가 어긋나는 곳 수 + 같은 (회계연도, 분기)에 종료일이 여럿인 곳 수."""
+    seq = sorted({(end, fy, q) for end, fy, q in period_of_accn.values()})
+    keys = [fy * 4 + q for _, fy, q in seq]
+    inversions = sum(1 for a, b in zip(keys, keys[1:]) if b <= a)
+    ends = {}
+    for end, fy, q in seq:
+        ends.setdefault((fy, q), set()).add(end)
+    return inversions + sum(len(v) - 1 for v in ends.values())
+
+
+def _relabel_if_disordered(period_of_accn: dict, annual_report: set) -> dict:
+    """분기 순서가 종료일 순서와 어긋나는 회사(AVAV: 2019Q4 종료일 2020-04-30, 2020Q1 종료일 2019-07-27)는
+    공시 전체를 종료일로 다시 계산한다. 분기: 10-K 종료일 사이 몇 번째 3개월인지. 회계연도: 최신 10-K의 회사 표기 기준.
+    어긋남(_disorder)이 줄어들 때만 바꾼다 (결산월 변경 전환기는 다시 계산해도 겹칠 수 있음)."""
+    before = _disorder(period_of_accn)
+    anchors = sorted({date.fromisoformat(period_of_accn[a][0]) for a in annual_report})
+    if not before or not anchors:
+        return period_of_accn
+    latest = max(annual_report, key=lambda a: (period_of_accn[a][0], a))
+    offset = period_of_accn[latest][1] - _fy_label_year(date.fromisoformat(period_of_accn[latest][0]))
+    tolerance = timedelta(days=7)
+    out = {}
+    for accn, (end, fy, q) in period_of_accn.items():
+        e = date.fromisoformat(end)
+        fy_end = next((d for d in anchors if d >= e - tolerance), None)
+        if fy_end is None:
+            k = 1
+            while _add_years(anchors[-1], k) < e - tolerance:
+                k += 1
+            fy_end = _add_years(anchors[-1], k)
+        fy_start = max((d for d in anchors if d < fy_end - timedelta(days=300)), default=None)
+        if fy_start is None or (fy_end - fy_start).days > 380:
+            fy_start = _add_years(fy_end, -1)
+        new_q = 4 if abs((fy_end - e).days) <= 7 else round((e - fy_start).days / 91.3)
+        out[accn] = (end, _fy_label_year(fy_end) + offset, new_q) if 1 <= new_q <= 4 else (end, fy, q)
+    return out if _disorder(out) < before else period_of_accn
 
 
 def _collided(period_of_accn: dict) -> set:
