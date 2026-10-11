@@ -133,6 +133,19 @@ def us(rows, volume):
             flags.append("시가총액 $1M 미만")
         if (r.get("발행주식수_출처") or "").find("분기 전") >= 0:
             flags.append("주식수 " + r["발행주식수_출처"].split(", ")[1])
+        if r.get("해외"):  # 20-F·40-F 회사: '통화 회계기준 제출 날짜'
+            currency, standard = r["해외"].split()[:2]
+            flags.append(f"해외 {currency}{' IFRS' if standard == 'ifrs-full' else ''}")
+            if (r.get("ADS_문구") or "").startswith("미확인") and "epositar" in r["ADS_문구"]:
+                flags.append("ADS 비율 미확인")
+            elif num(r.get("ADS비율")) not in (None, 1):
+                ratio = num(r["ADS비율"])
+                flags.append(f"ADS 1주 = 원주 {ratio:g}주")
+            if (r.get("발행주식수_출처") or "").startswith("가중평균"):
+                flags.append("주식수 가중평균 (단위 확인)")
+        ratio = num(r["시총÷순유동자산"])
+        if ratio is not None and ratio < 0.01:
+            flags.append("비율 0.01 미만: 주식수·단위 확인")
         out.append({
             "code": r["티커"], "name": r["회사명"],
             "ratio": num(r["시총÷순유동자산"]), "price": num(r["종가"]),

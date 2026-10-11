@@ -636,6 +636,195 @@ def edgar_records(facts: dict):
     return quarters, annual
 
 
+# ---------------------------------------------------------------- EDGAR 해외 기업 (20-F, 40-F, 6-K)
+
+FOREIGN_FORMS = {"20-F", "20-F/A", "40-F", "40-F/A", "6-K", "6-K/A", "10-K", "10-K/A", "10-Q", "10-Q/A"}
+FOREIGN_ANNUAL_FORMS = {"20-F", "20-F/A", "40-F", "40-F/A", "10-K", "10-K/A"}
+# IFRS 회사의 항목 이름. us-gaap으로 내는 해외 회사는 EDGAR_TAGS를 그대로 쓴다
+IFRS_TAGS = {
+    "current_assets": ["CurrentAssets"],
+    "total_liabilities": ["Liabilities"],
+    "net_income": ["ProfitLossAttributableToOwnersOfParent", "ProfitLoss"],
+    "buyback": ["PaymentsToAcquireOrRedeemEntitysShares", "PurchaseOfTreasuryShares"],
+    "minority": ["NoncontrollingInterests"],
+}
+WEIGHTED_SHARES_TAGS = {"us-gaap": ["WeightedAverageNumberOfSharesOutstandingBasic"], "ifrs-full": ["WeightedAverageShares"]}
+
+
+def _foreign_entries(facts, taxonomy, tags, units=None):
+    """_edgar_entries와 같지만 해외 공시 양식, 단위(통화)는 entry["unit"]에 붙여 모두 모은다."""
+    entries = []
+    for rank, tag in enumerate(tags):
+        for unit, es in facts["facts"].get(taxonomy, {}).get(tag, {}).get("units", {}).items():
+            if units is None or unit in units:
+                entries += [{**e, "unit": unit, "_rank": rank} for e in es if e.get("form") in FOREIGN_FORMS]
+    return sorted(entries, key=lambda e: (-e["_rank"], e["filed"]))
+
+
+def foreign_taxonomy(facts: dict):
+    """유동자산이 가장 최근까지 있는 회계기준 ('us-gaap' 또는 'ifrs-full'). 둘 다 없으면 None."""
+    best = None
+    for taxonomy, tag in (("us-gaap", "AssetsCurrent"), ("ifrs-full", "CurrentAssets")):
+        ends = [e["end"] for e in _foreign_entries(facts, taxonomy, [tag])]
+        if ends and (best is None or max(ends) > best[1]):
+            best = (taxonomy, max(ends))
+    return best and best[0]
+
+
+def _shift_month(d: date) -> date:
+    """52·53주 회계연도(1/2, 12/29 종료 등)를 가까운 월말로 보려고 15일 앞당긴 날짜."""
+    return d - timedelta(days=15)
+
+
+def foreign_records(facts: dict, fx):
+    """해외 기업(20-F·40-F 연간, 6-K 반기·분기) companyfacts → (분기 record, 연간 record). 금액은 모두 달러.
+
+    fx(통화, 'YYYY-MM-DD') → 1 단위의 달러 가치 (없으면 None).
+    - 통화: 유동자산에 가장 많이 쓴 단위가 보고 통화. 그 통화 값을 기간 말 환율로 바꾸고, 환율이 없으면 회사가 같이 적은 달러 값.
+      (흐름 항목인 순이익·자사주매입도 기간 말 환율. 평균 환율과 조금 다름)
+    - 기간: 유동자산이 있는 종료일마다 한 기간. 분기 = 연간 공시(20-F 등) 종료월 기준 몇 번째 3개월, 회계연도 = 끝나는 해.
+    - 순이익·자사주매입: 3개월 값(분기)과 최근 12개월 값(*_ttm). 12개월 = 1년 값, 없으면 연초누적 + 전년 연간 − 전년 같은 기간 누적.
+      연간만 내는 회사는 4분기 행만 생긴다.
+    - 발행주식수: 그 공시 표지(dei) 값, 없으면 가중평균 (기간이 짧은 것 우선). 원주 기준이라 ADS 비율은 screen-edgar에서 반영.
+    """
+    taxonomy = foreign_taxonomy(facts)
+    if taxonomy is None:
+        raise ValueError("유동자산 없음")
+    tags = EDGAR_TAGS if taxonomy == "us-gaap" else IFRS_TAGS
+    ca_entries = _foreign_entries(facts, taxonomy, tags["current_assets"])
+    unit_count = {}
+    for e in ca_entries:
+        unit_count[e["unit"]] = unit_count.get(e["unit"], 0) + 1
+    currency = max(unit_count, key=unit_count.get)
+
+    def to_usd(entries_by_unit, end):
+        """같은 기간의 단위별 값 → (달러 값, 환율, 쓴 통화). 보고 통화 → 달러 → 그 밖의 통화 순."""
+        for unit in [currency, "USD", *sorted(entries_by_unit)]:
+            if unit not in entries_by_unit:
+                continue
+            rate = 1.0 if unit == "USD" else fx(unit, end)
+            if rate is not None:
+                return entries_by_unit[unit] * rate, rate, unit
+        return None, None, None
+
+    def latest(entries):
+        """{(시작, 종료): {단위: 값}}. 뒤에 오는 값(우선순위 높은 항목명 → 최근 제출)이 이긴다."""
+        out = {}
+        for e in entries:
+            out.setdefault((e.get("start"), e["end"]), {})[e["unit"]] = e["val"]
+        return out
+
+    # 기간: 연간 공시 종료월(가장 흔한 월)을 회계연도 끝으로 본다
+    annual_months = [_shift_month(date.fromisoformat(e["end"])).month for e in ca_entries if e["form"] in FOREIGN_ANNUAL_FORMS]
+    months = annual_months or [_shift_month(date.fromisoformat(e["end"])).month for e in ca_entries]
+    fye = max(set(months), key=months.count)
+    filed_of, accn_end = {}, {}
+    for e in ca_entries:
+        filed_of[e["end"]] = min(filed_of.get(e["end"], e["filed"]), e["filed"])
+        accn_end[e["accn"]] = max(accn_end.get(e["accn"], e["end"]), e["end"])
+    periods = {}
+    for end in sorted(filed_of):
+        s = _shift_month(date.fromisoformat(end))
+        k = (s.month - fye) % 12  # 회계연도 시작 후 몇 달째에 끝나는지 (0 = 회계연도 끝)
+        q = 4 if k == 0 or k == 11 else min(max(round(k / 3), 1), 3)
+        fy = s.year if s.month <= fye else s.year + 1
+        periods[end] = (fy, q)
+    ends = sorted(periods)
+    quarters = {periods[end]: {"year": periods[end][0], "q": periods[end][1], "end": end, "filed": filed_of[end]}
+                for end in ends}
+
+    for key in ("current_assets", "total_liabilities", "temporary_equity", "preferred_liquidation", "preferred_book",
+                "minority"):
+        values = {end: v for (_, end), v in latest(_foreign_entries(facts, taxonomy, tags.get(key, []))).items()}
+        for end in ends:
+            usd, rate, unit = to_usd(values.get(end, {}), end)
+            quarters[periods[end]][key] = usd
+            if key == "current_assets":  # 유동자산에 쓴 통화·환율 (환율이 없는 통화는 회사가 적은 달러 값 → USD)
+                quarters[periods[end]]["currency"], quarters[periods[end]]["fx"] = unit, rate
+    for rec in quarters.values():  # us-gaap 회사의 우선주 (IFRS는 우선주 항목이 없어 None)
+        rec["preferred"], rec["preferred_source"] = _preferred_total(
+            rec.pop("temporary_equity"), rec.pop("preferred_liquidation"), rec.pop("preferred_book"), None, None)
+
+    annual = {}
+    for key in ("net_income", "buyback"):
+        values = latest(e for e in _foreign_entries(facts, taxonomy, tags[key]) if "start" in e)
+        usd = {}
+        for (start, end), by_unit in values.items():
+            v, _, _ = to_usd(by_unit, end)
+            if v is not None:
+                usd[(start, end)] = (v, (date.fromisoformat(end) - date.fromisoformat(start)).days)
+        by_end = {}
+        for (start, end), (v, d) in usd.items():
+            by_end.setdefault(end, []).append((d, start, v))
+
+        def near(end_d, days, tol=7):
+            """종료일이 end_d ± tol일, 기간이 days ± tol일인 값."""
+            for e_str, items in by_end.items():
+                if abs((date.fromisoformat(e_str) - end_d).days) <= tol:
+                    for d, _, v in items:
+                        if abs(d - days) <= tol:
+                            return v
+            return None
+
+        for end in ends:
+            rec = quarters[periods[end]]
+            items = by_end.get(end, [])
+            rec[key] = next((v for d, _, v in items if 80 <= d <= 100), None)
+            ttm = next((v for d, _, v in items if 350 <= d <= 380), None)
+            if ttm is None:
+                for d, start, v in sorted(items):
+                    if 100 < d < 350:  # 연초누적 + 전년 연간 − 전년 같은 기간 누적
+                        prior_annual = near(date.fromisoformat(start) - timedelta(days=1), 365)
+                        prior_ytd = near(date.fromisoformat(end) - timedelta(days=365), d)
+                        if prior_annual is not None and prior_ytd is not None:
+                            ttm = v + prior_annual - prior_ytd
+                            break
+            rec[f"{key}_ttm"] = ttm
+            if rec["q"] == 4:
+                annual.setdefault(rec["year"], {"year": rec["year"], "q": 4})[key] = \
+                    next((v for d, _, v in items if 350 <= d <= 380), None)
+
+    # 발행주식수: 공시 표지(dei) 값 → 그 공시의 보고기간에 연결 (주식 종류가 여러 개면 합산)
+    shares_by_accn = {}
+    for e in _foreign_entries(facts, "dei", ["EntityCommonStockSharesOutstanding"], {"shares"}):
+        if e["accn"] in accn_end:
+            by_date = shares_by_accn.setdefault(e["accn"], {})
+            by_date[e["end"]] = by_date.get(e["end"], 0) + e["val"]
+    for accn, by_date in sorted(shares_by_accn.items(), key=lambda x: max(x[1])):
+        rec = quarters[periods[accn_end[accn]]]
+        rec["shares"], rec["shares_source"], rec["shares_date"] = by_date[max(by_date)], "표지", max(by_date)
+    # 가중평균을 천 주 단위로 적은 회사(NVMI 30,108 = 3,011만 주, EH)가 있어 순이익 ÷ 가중평균과 공시 주당순이익을 비교해
+    # 1,000배(또는 100만 배) 어긋나면 그만큼 곱한다. 주당순이익이 ADS 기준이면 ADS 비율만큼 어긋나는데 그건 그대로 둔다
+    eps_tags = (["EarningsPerShareBasic", "IncomeLossFromContinuingOperationsPerBasicShare"] if taxonomy == "us-gaap"
+                else ["BasicEarningsLossPerShare"])
+    eps = {}
+    for e in _foreign_entries(facts, taxonomy, eps_tags):
+        if "start" in e and e["unit"].startswith(currency) and e["val"]:
+            eps[(e["start"], e["end"])] = e["val"]
+    profit = {(e["start"], e["end"]): e["val"] for e in _foreign_entries(facts, taxonomy, tags["net_income"])
+              if "start" in e and e["unit"] == currency}
+    weighted = {}
+    for e in _foreign_entries(facts, taxonomy, WEIGHTED_SHARES_TAGS[taxonomy], {"shares"}):
+        if "start" in e and e["val"] > 0 and _days(e) >= 80:
+            val, key = e["val"], (e["start"], e["end"])
+            if eps.get(key) and profit.get(key):
+                gap = profit[key] / val / eps[key]
+                for scale in (1_000, 1_000_000):
+                    if scale / 2 <= gap <= scale * 2:
+                        val *= scale
+            if e["end"] not in weighted or _days(e) <= weighted[e["end"]][0]:
+                weighted[e["end"]] = (_days(e), val, e["filed"])
+    for end in ends:
+        rec = quarters[periods[end]]
+        if rec.get("shares") is None and end in weighted:
+            rec["shares"], rec["shares_source"], rec["shares_date"] = weighted[end][1], "가중평균", weighted[end][2]
+
+    for rec in quarters.values():
+        if rec["q"] == 4 and rec["year"] in annual:
+            annual[rec["year"]].update({k: rec.get(k) for k in (*BALANCE_KEYS, "end", "currency", "fx")})
+    return quarters, annual
+
+
 # ---------------------------------------------------------------- 주식분할 탐지
 
 SPLIT_MIN_RATIO = 1.5   # 이보다 작은 변화는 분할로 보지 않음
@@ -724,6 +913,8 @@ def quarterly_table(quarters: dict) -> list[dict]:
                 last_shares = last_source = last_date = None
 
         def ttm(y, qq, key):
+            if f"{key}_ttm" in quarters.get((y, qq), {}):  # 해외 기업: 12개월 값을 직접 계산해 둠 (foreign_records)
+                return quarters[(y, qq)][f"{key}_ttm"]
             vals = [quarters.get(_prev_quarter(y, qq, k), {}).get(key) for k in range(4)]
             return None if None in vals else sum(vals)
 
@@ -981,6 +1172,99 @@ def xbrl_cover_classes(xml_bytes: bytes) -> list[dict]:
         elif local == "TradingSymbol" and el.text.strip():
             symbols[member] = el.text.strip().upper()
     return [{"member": m, "symbol": symbols.get(m), "shares": v, "date": d} for m, (d, v) in sorted(shares.items())]
+
+
+NUMBER_WORDS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen "
+    "eighteen nineteen twenty".split())} | {"thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+                                            "eighty": 80, "ninety": 90, "a": 1, "an": 1}
+FRACTION_WORDS = {"half": 2, "third": 3, "quarter": 4, "fourth": 4, "fifth": 5, "tenth": 10, "twentieth": 20,
+                  "fortieth": 40, "fiftieth": 50, "hundredth": 100}
+DEPOSITARY = re.compile(r"depositary|depository|\bads\b|\badss\b|\badr\b|\badrs\b", re.I)
+
+
+def _parse_count(text: str):
+    """'fifty', 'one hundred', 'twenty-five', '1,000', '0.5', 'one-half', 'five (5)' → 수. 못 읽으면 None."""
+    text = text.strip().lower().replace("-", " ")
+    m = re.match(r"(\d[\d,]*(?:\.\d+)?)", text)
+    if m:
+        return float(m.group(1).replace(",", ""))
+    m = re.match(r"(\d+)\s*/\s*(\d+)", text)
+    if m:
+        return int(m.group(1)) / int(m.group(2))
+    words = text.split()
+    if len(words) >= 2 and words[0] in NUMBER_WORDS and words[1].rstrip("s") in FRACTION_WORDS:  # one-half, two-thirds
+        return NUMBER_WORDS[words[0]] / FRACTION_WORDS[words[1].rstrip("s")]
+    total, current, used = 0, 0, False
+    for w in words:
+        if w in NUMBER_WORDS and not (w in ("a", "an") and used):
+            current += NUMBER_WORDS[w]
+            used = True
+        elif w == "hundred" and used:
+            current *= 100
+        elif w == "thousand" and used:
+            total, current = total + current * 1000, 0
+        elif w == "and" and used:
+            continue
+        else:
+            break
+    return total + current if used else None
+
+
+def ads_ratio_from_title(title: str):
+    """증권 명칭(Security12bTitle) → ADS 1주가 나타내는 원주 수. ADS가 아니면 1, ADS인데 비율을 못 읽으면 None.
+
+    예: 'American Depositary Shares, each representing fifty ordinary shares' → 50,
+    'ADSs, every five of which represent one ordinary share' → 0.2, 'Ordinary shares' → 1.
+    """
+    import html
+    text = re.sub(r"\s+", " ", html.unescape(title)).strip()
+    if not DEPOSITARY.search(text):
+        return 1.0
+    low = text.lower()
+    m = re.search(r"every\s+([\w\-, ()./]+?)\s+(?:of\s+which\s+|american\s+depositary\s+shares?\s+|adss?\s+)?"
+                  r"represents?\s+([\w\-, ()./]+?)\s+(?:class\s+\w+\s+)?(?:ordinary|common|share)", low)
+    if m:
+        n, k = _parse_count(m.group(1)), _parse_count(m.group(2))
+        return k / n if n and k else None
+    # 'each twenty (20) ADSs representing one (1) common share' → 1/20
+    m = re.search(r"\b(?:each|every)\s+([a-z\-]+|\d[\d,.]*)\s*(?:\(\s*[\d.,]+\s*\)\s*)?"
+                  r"(?:american\s+depositary\s+shares|adss)\s*,?\s*(?:together\s+)?represent(?:s|ing)?\s+"
+                  r"([\w\-, ()./]+?)\s+(?:class\s+\w+\s+)?(?:ordinary|common|share)", low)
+    if m and _parse_count(m.group(1)) not in (None, 1):
+        n, k = _parse_count(m.group(1)), _parse_count(m.group(2))
+        return k / n if n and k else None
+    m = re.search(r"represent(?:s|ing)?\s+(?:the\s+right\s+to\s+receive\s+)?(?:an?\s+)?"
+                  r"([\w\-,()./]+(?:[\s\-]+[\w\-,()./]+){0,3}?)\s+(?:\(\s*[\d.,/]+\s*\)\s+)?"
+                  r"(?:of\s+(?:an?\s+|one\s+)?)?(?:class\s+\w+\s+|series\s+\w+\s+|fully\s+paid\s+|registered\s+|non-voting\s+)*"
+                  r"(?:ordinary|common|share|b\s+share|equity)", low)
+    if m:
+        return _parse_count(m.group(1))
+    return None
+
+
+def xbrl_ads_ratio(xml_bytes: bytes, ticker: str) -> dict:
+    """20-F·40-F 표지의 증권 명칭에서 ticker(대표 티커)의 ADS 비율. 반환: {ratio, title}
+
+    티커와 같은 문맥(context)의 명칭을 먼저 보고, 없으면 ADS 명칭 아무거나, 그것도 없으면 첫 명칭.
+    명칭이 하나도 없으면 ratio None. ADS가 아닌 명칭이면 1.
+    """
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_bytes)
+    titles, symbols = {}, {}
+    for el in root:
+        if not isinstance(el.tag, str) or "/dei/" not in el.tag or not (el.text or "").strip():
+            continue
+        local = el.tag.split("}")[1]
+        if local == "Security12bTitle" or local == "Security12gTitle":
+            titles.setdefault(el.get("contextRef"), el.text.strip())
+        elif local == "TradingSymbol":
+            symbols.setdefault(el.get("contextRef"), el.text.strip().upper())
+    norm = lambda s: re.sub(r"[^A-Z0-9]", "", s or "")
+    mine = [t for c, t in titles.items() if norm(symbols.get(c)) == norm(ticker)]
+    ads = [t for t in titles.values() if DEPOSITARY.search(t)]
+    title = (mine or ads or list(titles.values()) or [None])[0]
+    return {"ratio": ads_ratio_from_title(title) if title else None, "title": title and re.sub(r"\s+", " ", title)}
 
 
 def xbrl_convertible_preferred(xml_bytes: bytes, period_end: str) -> float | None:

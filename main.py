@@ -25,6 +25,7 @@
     python main.py refresh-edgar PRTH WTBA       # 일부 회사만 companyfacts로 다시 계산해 글자별 파일에 반영
     python main.py fill-edgar-ends               # 글자별 결과에 보고기간 종료일 열 추가 (값은 그대로)
     python main.py fill-edgar-balance            # 글자별 결과의 발행주식수·우선주·비지배지분·주당순유동자산만 다시 계산 (나머지 열은 그대로)
+    python main.py analyze-foreign-batch         # 해외 기업(20-F·40-F) → edgar/해외_분기.csv, 해외_연간.csv (달러 환산)
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
     python main.py us-prices                     # 미국 월별 주가 (Alpaca, 2016년부터) → edgar/주가_월별.csv
 
@@ -147,6 +148,96 @@ def analyze_edgar_batch(edgar: EdgarClient, prefix: str) -> None:
     save_csv(f"analysis/{tag}_분기.csv", q_all, list(q_all[0]) if q_all else [])
     save_csv(f"analysis/{tag}_연간.csv", a_all, list(a_all[0]) if a_all else [])
     save_csv(f"analysis/{tag}_실패.csv", failed, ["ticker", "name", "cik", "error"])
+
+
+FX_URL = "https://api.frankfurter.dev/v1"  # 유럽중앙은행 기준환율 (영업일, 키 없음)
+
+
+def usd_fx():
+    """fx(통화, 'YYYY-MM-DD') → 1 단위의 달러 가치. 그날(휴일이면 10일 안의 직전 영업일) 환율, 없으면 None.
+
+    Frankfurter(ECB) 30개 통화. 대만 달러·아르헨티나 페소 등은 없음. 연도별로 data/cache/fx/usd_<연도>.json에 저장 (올해는 매번 다시 받음).
+    """
+    rates = {}
+    for year in range(2009, date.today().year + 1):
+        cache = DATA_DIR / f"cache/fx/usd_{year}.json"
+        if cache.exists() and year < date.today().year:
+            rates |= json.loads(cache.read_text(encoding="utf-8"))
+            continue
+        resp = requests.get(f"{FX_URL}/{year}-01-01..{year}-12-31", params={"base": "USD"}, timeout=60)
+        resp.raise_for_status()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(resp.json()["rates"]), encoding="utf-8")
+        rates |= resp.json()["rates"]
+    days = sorted(rates)
+
+    def fx(currency: str, day: str):
+        if currency == "USD":
+            return 1.0
+        d = date.fromisoformat(day)
+        for back in range(11):
+            per_usd = rates.get((d - timedelta(days=back)).isoformat(), {}).get(currency)
+            if per_usd:
+                return 1 / per_usd
+        return None
+    fx.last_day = days[-1] if days else None
+    return fx
+
+
+def analyze_foreign_batch(edgar: EdgarClient, workers: int = 6) -> None:
+    """해외 기업(20-F·40-F)을 분석해 edgar/해외_분기.csv, 해외_연간.csv로 저장한다 (미국 글자별 파일과 따로).
+
+    대상: SEC 티커 목록에서 미국 합친 표(분기.csv)에 없는 회사 중 유동자산을 20-F·40-F로 공시한 회사.
+    금액은 달러 (기간 말 환율, analysis.foreign_records). 분기표에 '제출일'(그 기간이 처음 공시된 날), '통화', '환율' 열.
+    """
+    fx = usd_fx()
+    us = {r["CIK"] for r in _load_csv(DATA_DIR / "analysis/edgar/분기.csv")}
+    companies = {}
+    for c in edgar.tickers():
+        if c["cik"] not in us:
+            companies.setdefault(c["cik"], c)
+    print(f"미국 표에 없는 회사 {len(companies)}곳", flush=True)
+
+    def one(cik):
+        try:
+            facts = edgar.company_facts(cik)
+        except requests.HTTPError as e:
+            return None, f"companyfacts {e.response.status_code}"
+        if "facts" not in facts:
+            return None, None
+        taxonomy = analysis.foreign_taxonomy(facts)
+        ca_tag = "AssetsCurrent" if taxonomy == "us-gaap" else "CurrentAssets"
+        if taxonomy is None or not any(e["form"] in ("20-F", "20-F/A", "40-F", "40-F/A")
+                                       for e in analysis._foreign_entries(facts, taxonomy, [ca_tag])):
+            return None, None  # 해외 공시가 아님 (펀드, 미국 회사 등)
+        try:
+            return analysis.foreign_records(facts, fx), taxonomy
+        except Exception as e:
+            return None, f"{type(e).__name__}: {str(e)[:150]}"
+
+    q_all, a_all, failed, done = [], [], [], 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for (cik, c), (records, info) in zip(companies.items(), pool.map(one, companies)):
+            done += 1
+            if done % 200 == 0:
+                print(f"{done}/{len(companies)} 진행, 해외 기업 {len({r['CIK'] for r in q_all})}곳", flush=True)
+            if records is None:
+                if info:
+                    failed.append({"ticker": c["ticker"], "name": c["name"], "cik": cik, "error": info})
+                continue
+            quarters, annual = records
+            head = {"CIK": cik, "티커": c["ticker"], "회사명": c["name"]}
+            for (key, rec), row in zip(sorted(quarters.items()), analysis.quarterly_table(quarters)):
+                extra = {"제출일": rec["filed"], "통화": rec.get("currency"), "환율": rec.get("fx"), "회계기준": info}
+                q_all.append({**head, "기간": row.pop("기간"), "종료일": row.pop("종료일"), **extra, **row})
+            for row in analysis.annual_table(annual):
+                rec = annual[row["연도"]]
+                a_all.append({**head, "연도": row.pop("연도"), "종료일": row.pop("종료일", rec.get("end")),
+                              "통화": rec.get("currency"), "환율": rec.get("fx"), "회계기준": info, **row})
+    save_csv("analysis/edgar/해외_분기.csv", q_all, list(q_all[0]) if q_all else [])
+    save_csv("analysis/edgar/해외_연간.csv", a_all, list(a_all[0]) if a_all else [])
+    save_csv("analysis/edgar/해외_실패.csv", failed, ["ticker", "name", "cik", "error"])
+    print(f"해외 기업 {len({r['CIK'] for r in q_all})}곳 (분기표 {len(q_all)}행, 연간표 {len(a_all)}행), 실패 {len(failed)}곳")
 
 
 BUYBACK_PRICE_RANGE = (0.1, 10_000)  # 달러/주
@@ -1181,6 +1272,80 @@ def _manual_convertible(as_of: date) -> dict:
     return out
 
 
+def _ads_ratio(edgar: EdgarClient, cik: str, ticker: str, as_of: date) -> dict:
+    """기준일 전에 낸 최신 20-F·40-F 표지의 ADS 비율과 종류별 발행주식수 {ratio, title, classes, accn}
+    (data/cache/edgar_xbrl/ads_<접수번호>_<티커>.json). companyfacts에 표지 주식수가 없는 해외 회사가 많아서 같이 읽는다."""
+    forms = ("20-F", "40-F", "20-F/A", "40-F/A")
+    filings = [f for f in edgar.filings(cik, forms, include_older=True) if f["isXBRL"] and f["filingDate"] <= as_of.isoformat()]
+    filings.sort(key=lambda f: (f["filingDate"], not f["form"].endswith("/A")), reverse=True)  # 최신, 같은 날이면 원본
+    for f in filings[:2]:
+        cache = DATA_DIR / "cache/edgar_xbrl" / f"ads_{f['accessionNumber']}_{ticker}.json"
+        found = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else {}
+        if "classes" not in found:
+            try:
+                xml = edgar.filing_instance(cik, f["accessionNumber"])
+                found = {**analysis.xbrl_ads_ratio(xml, ticker), "classes": analysis.xbrl_cover_classes(xml)}
+            except (FileNotFoundError, SyntaxError):
+                found = {"ratio": None, "title": None, "classes": []}
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(found, ensure_ascii=False), encoding="utf-8")
+        if found["title"]:
+            return {**found, "accn": f["accessionNumber"]}
+    return {"ratio": None, "title": None, "classes": [], "accn": None}
+
+
+def _apply_ads(edgar: EdgarClient, latest: dict, market: dict, foreign: set, as_of: date, manual_shares=()) -> dict:
+    """해외 기업의 발행주식수(원주)를 상장 증권(ADS) 단위로 바꾼다 (market을 고쳐 씀). 순유동자산이 양수인 회사만.
+
+    먼저 최신 20-F·40-F 표지 XBRL의 종류별 주식수(우선주 제외 합)가 분기표 값보다 새것이거나 분기표 값이 가중평균이면 그 값을 쓴다.
+    (companyfacts에 표지 주식수가 없는 회사가 많고, 가중평균을 천 주 단위로 잘못 적은 회사가 있다: EH 146,665 = 1억 4,667만 주)
+
+    ADS 1주 = 원주 N주면 ADS 수 = 원주 ÷ N. 비율은 20-F·40-F 표지 증권 명칭에서 읽고 (analysis.ads_ratio_from_title),
+    manual_shares.csv의 'ADS비율' 열이 있으면 그 값. 못 읽으면 1로 두고 '미확인'.
+    반환: {티커: {"ratio": 쓴 비율, "note": 설명}}
+    """
+    num = analysis._num
+    path = DATA_DIR.parent / "manual_shares.csv"
+    manual = {m["티커"]: (float(m["ADS비율"]), m["출처"]) for m in (_load_csv(path) if path.exists() else [])
+              if m.get("ADS비율") and m["기준일"] <= as_of.isoformat()}
+    targets = []
+    for t in foreign:
+        r = latest.get(t)
+        if t not in market or not r:
+            continue
+        ca, tl = num(r["유동자산"]), num(r["총부채"])
+        if ca is not None and tl is not None and ca - tl - (num(r.get("우선주")) or 0) - max(num(r.get("비지배지분")) or 0, 0) > 0:
+            targets.append(t)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        found = dict(zip(targets, pool.map(lambda t: _ads_ratio(edgar, latest[t]["CIK"], t, as_of), targets)))
+    out = {}
+    for t in targets:
+        f, r = found[t], latest[t]
+        classes = [c for c in f.get("classes", []) if "Preferred" not in c["member"] and c["shares"] > 0]
+        # 종류별 값과 그 합계를 같이 적은 표지(LX: A주 + B주 + CommonStockMember 합계)는 합계를 뺀다
+        classes = [c for c in classes if len(classes) < 3 or
+                   abs(c["shares"] - sum(o["shares"] for o in classes if o is not c)) > 0.01 * c["shares"]]
+        cover_date = max((c["date"] for c in classes if c["date"]), default="")
+        # 같은 연간 공시라도 companyfacts에는 종류 하나만 잡히는 회사가 있어(GENI 1,000만 주 vs 표지 합 2.6억 주)
+        # 표지 원문이 같은 날짜 이후면 원문 합을 쓴다
+        if (classes and t not in manual_shares and cover_date <= as_of.isoformat()
+                and cover_date >= (r.get("발행주식수_기준일") or "")):
+            shares = sum(c["shares"] for c in classes)
+            market[t] = {**market[t], "shares": shares, "mktcap": shares * market[t]["close"]}
+            r["발행주식수_출처"], r["발행주식수_기준일"] = "연간 공시 표지", cover_date
+        parsed = analysis.ads_ratio_from_title(f["title"]) if f["title"] else None  # 캐시의 ratio 대신 지금 규칙으로
+        if t in manual:
+            ratio, note = manual[t][0], f"수동: {manual[t][1]}"
+        elif parsed:
+            ratio, note = parsed, f["title"] if analysis.DEPOSITARY.search(f["title"]) else ""
+        else:
+            ratio, note = 1.0, f"미확인: {f['title'] or '표지 증권 명칭 없음'}"
+        out[t] = {"ratio": ratio, "note": note}
+        if ratio != 1:
+            market[t] = {**market[t], "shares": market[t]["shares"] / ratio, "mktcap": market[t]["mktcap"] / ratio}
+    return out
+
+
 def _split_adjust(latest: dict, market: dict, prices: list[dict], month: str) -> dict:
     """주식수 기준일 이후 ~ 기준월 말 사이의 주식분할·병합을 주식수에 반영한다 (market을 고쳐 씀).
 
@@ -1220,6 +1385,9 @@ def _split_adjust(latest: dict, market: dict, prices: list[dict], month: str) ->
     return notes
 
 
+FOREIGN_MAX_AGE = 550  # 해외 기업 재무 종료일이 기준일보다 이만큼(일) 넘게 오래되면 제외 (20-F 연간 + 제출기한 4개월 + 여유)
+
+
 def screen_edgar(args: list[str]) -> None:
     """미국 넷넷 스크리너. EDGAR 합친 결과 + Alpaca 월말 원래 종가. 옵션:
     [YYYY-MM]            주가 기준 월 (기본: 주가 파일의 최신 월)
@@ -1250,6 +1418,16 @@ def screen_edgar(args: list[str]) -> None:
                 and not NON_COMMON_TICKER.search(r["티커"])):
             if r["티커"] not in latest or r["종료일"] > latest[r["티커"]]["종료일"]:
                 latest[r["티커"]] = r
+    # 해외 기업(20-F·40-F): 연간만 내는 회사가 많아 종료일 기준 FOREIGN_MAX_AGE일까지, 기준일 전에 제출된 기간만
+    foreign = set()
+    foreign_path = edgar_dir / "해외_분기.csv"
+    for r in (_load_csv(foreign_path) if foreign_path.exists() and "--no-foreign" not in args else []):
+        end = date.fromisoformat(r["종료일"])
+        if (as_of - timedelta(days=FOREIGN_MAX_AGE) <= end and r["제출일"] <= as_of.isoformat() and r["주당순유동자산"]
+                and (r["티커"] not in latest or r["티커"] in foreign) and not NON_COMMON_TICKER.search(r["티커"])):
+            if r["티커"] not in foreign or r["종료일"] > latest[r["티커"]]["종료일"]:
+                latest[r["티커"]] = r
+                foreign.add(r["티커"])
 
     annual_by = {}
     for r in _load_csv(edgar_dir / "연간.csv"):
@@ -1277,13 +1455,15 @@ def screen_edgar(args: list[str]) -> None:
     class_notes = _class_market_caps(edgar, latest, market, close, others, month)
     manual_notes = _manual_shares(latest, market, close, as_of)
     class_notes |= manual_notes
+    ads = _apply_ads(edgar, latest, market, foreign, as_of, manual_notes)
     split_notes = _split_adjust(latest, market, prices, month)
     max_ratio = float(opt("--ratio", 2 / 3))
     profit_years = int(opt("--profit-years", 3))
     print(f"주가 {month} 말 / 분기 종료일 {start} ~ {as_of - timedelta(days=lag)} / "
           f"가격 있는 종목 {len(close)}, 조건에 맞는 분기가 있는 회사 {len(latest)}, "
           f"주식 종류별로 시가총액을 다시 계산한 회사 {len(class_notes) - len(manual_notes)}, 수동 주식수 {len(manual_notes)}, "
-          f"분할·병합 보정 {len(split_notes)}")
+          f"분할·병합 보정 {len(split_notes)}, 해외 기업 {len(foreign)} (ADS 비율 ≠ 1: {sum(a['ratio'] != 1 for a in ads.values())}, "
+          f"미확인 {sum(a['note'].startswith('미확인') for a in ads.values())})")
     passed, stages = analysis.screen_net_net(rows, "기준", market, max_ratio, profit_years,
                                              None if "--no-profit" in args else set(opt("--profit", "흑자,흑자전환").split(",")),
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
@@ -1318,7 +1498,9 @@ def screen_edgar(args: list[str]) -> None:
                     "분할보정": split_notes.get(t, ""),
                     "시가총액_계산": class_notes.get(t, ""),
                     "전환우선주_보통주환산": conv or "", "전환후_시총÷순유동자산": diluted,
-                    "같은 회사 다른 티커": " ".join(o for o in others.get(r["CIK"], []) if o != t)})
+                    "같은 회사 다른 티커": " ".join(o for o in others.get(r["CIK"], []) if o != t),
+                    "해외": f"{r['통화']} {r['회계기준']} 제출 {r['제출일']}" if t in foreign else "",
+                    "ADS비율": ads[t]["ratio"] if t in ads else "", "ADS_문구": ads.get(t, {}).get("note", "")})
     save_csv(f"analysis/edgar/screen_{month}.csv", out, list(out[0]) if out else ["티커"])
 
 
@@ -1366,7 +1548,9 @@ def us_prices(chunk: int = 200) -> None:
     """
     alpaca = AlpacaClient(os.getenv("ALPACA_KEY_ID", ""), os.getenv("ALPACA_SECRET_KEY", ""),
                           cache_dir=DATA_DIR / "cache/alpaca")
-    tickers = sorted({r["티커"] for r in _load_csv(DATA_DIR / "analysis/edgar/분기.csv")})
+    foreign = DATA_DIR / "analysis/edgar/해외_분기.csv"
+    tickers = sorted({r["티커"] for path in (DATA_DIR / "analysis/edgar/분기.csv", foreign) if path.exists()
+                      for r in _load_csv(path)})
     symbol_of = {t: t.replace("-", ".") for t in tickers}  # SEC BRK-B → Alpaca BRK.B
     ticker_of = {s: t for t, s in symbol_of.items()}
     symbols = sorted(ticker_of)
@@ -1379,6 +1563,12 @@ def us_prices(chunk: int = 200) -> None:
         raw.update(_alpaca_bars(alpaca, part, start, end, "raw", skipped))
         split.update(_alpaca_bars(alpaca, part, start, end, "split", []))
         print(f"{min(i + chunk, len(symbols))}/{len(symbols)}개 종목, 가격 있는 종목 {len(raw)}", flush=True)
+    # 여러 종목을 한 번에 받으면 Alpaca가 가끔 종목 하나를 통째로 빠뜨린다 (DOW: 단독 요청이면 있음) → 빠진 종목만 작게 다시
+    for kind, got in (("raw", raw), ("split", split)):
+        missing = [s for s in symbols if s not in got and (kind == "raw" or s in raw)]
+        for i in range(0, len(missing), 20):
+            got.update(_alpaca_bars(alpaca, missing[i:i + 20], start, end, kind, []))
+        print(f"{kind}: 빠진 {len(missing)}개 다시 받음 → 가격 있는 종목 {len(got)}", flush=True)
 
     rows = []
     for symbol in sorted(raw):
@@ -1535,6 +1725,9 @@ def main(argv: list[str]) -> None:
             return [int(y) for y in rest[:next((i for i, a in enumerate(rest) if a.startswith("--")), len(rest))]]
         analyze_dart_batch(DartClient(os.getenv("DART_API_KEY", "")), int(args[0]), int(args[1]),
                            years_after("--buyback"), years_after("--buyback-quarterly"))
+
+    elif cmd == "analyze-foreign-batch":
+        analyze_foreign_batch(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
 
     elif cmd == "analyze-edgar-batch":
         analyze_edgar_batch(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")), args[0])
