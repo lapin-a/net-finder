@@ -133,14 +133,14 @@ def us(rows, volume):
             flags.append("시가총액 $1M 미만")
         if (r.get("발행주식수_출처") or "").find("분기 전") >= 0:
             flags.append("주식수 " + r["발행주식수_출처"].split(", ")[1])
-        if r.get("해외"):  # 20-F·40-F 회사: '통화 회계기준 제출 날짜'
+        foreign = ""
+        if r.get("해외"):  # 20-F·40-F 회사: '통화 회계기준 제출 날짜' → 이름 옆 표시 (확인 필요 아님)
             currency, standard = r["해외"].split()[:2]
-            flags.append(f"해외 {currency}{' IFRS' if standard == 'ifrs-full' else ''}")
+            foreign = f"해외 {currency}{' IFRS' if standard == 'ifrs-full' else ''}"
+            if num(r.get("ADS비율")) not in (None, 1):
+                foreign += f" · ADS 1주=원주 {num(r['ADS비율']):g}주"
             if (r.get("ADS_문구") or "").startswith("미확인") and "epositar" in r["ADS_문구"]:
                 flags.append("ADS 비율 미확인")
-            elif num(r.get("ADS비율")) not in (None, 1):
-                ratio = num(r["ADS비율"])
-                flags.append(f"ADS 1주 = 원주 {ratio:g}주")
             if (r.get("발행주식수_출처") or "").startswith("가중평균"):
                 flags.append("주식수 가중평균 (단위 확인)")
         ratio = num(r["시총÷순유동자산"])
@@ -151,7 +151,7 @@ def us(rows, volume):
             "ratio": num(r["시총÷순유동자산"]), "price": num(r["종가"]),
             "ncavps": num(r["주당순유동자산"]), "mcap": mcap, "ncav": num(r["순유동자산"]),
             "ni": num(r["순이익"]), "status": r.get("순이익상태_3년", ""), "flags": flags,
-            "vol": round(volume.get(r["티커"], 0)), "kind": kinds.get(r["CIK"], ""),
+            "vol": round(volume.get(r["티커"], 0)), "kind": kinds.get(r["CIK"], ""), "foreign": foreign,
         })
     return out
 
@@ -167,7 +167,7 @@ data = {
             "niLabel": "순이익(최근 4분기)", "rows": kr(load(A / f"dart/screen_2026Q2_{kr_q}.csv"), kr_volume(kr_q))},
     "kry": {"label": "한국 2025년 연간", "cur": "KRW", "asof": f"재무 2025년 · 주가 {fmt_day(kr_y)}",
             "niLabel": "순이익(2025)", "rows": kr(load(A / f"dart/screen_2025_{kr_y}.csv"), kr_volume(kr_y))},
-    "us": {"label": "미국 2026년 9월", "cur": "USD", "asof": f"주가 {us_month} 말 · 회사별 최신 분기 재무",
+    "us": {"label": "미국 2026년 9월", "cur": "USD", "asof": f"주가 {us_month} 말 · 회사별 최신 분기 재무 (해외 기업은 최신 20-F·40-F·6-K)",
            "niLabel": "순이익(최근 4분기)", "rows": us(load(A / f"edgar/screen_{us_month}.csv"), us_volume(us_month))},
 }
 tpl = (ROOT / "report/template.html").read_text(encoding="utf-8")

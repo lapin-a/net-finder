@@ -19,7 +19,7 @@
   --accent: #4fc2b4; --accent-soft: #173a36; --warn: #e7b05a; --warn-soft: #3a2d17;
   --bad: #ec8a92; --bad-soft: #3d2124; --good: #74cf9d; --good-soft: #1b3426; color-scheme: dark }
 body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.55; }
-.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 48px; display: grid; gap: 22px; }
+.wrap { max-width: 1560px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 48px; display: grid; gap: 22px; }
 header { display: grid; gap: 8px; }
 h1 { font-size: 1.6rem; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
 .formula { font-family: var(--mono); font-size: 0.95rem; color: var(--accent); }
@@ -59,7 +59,7 @@ tbody tr:hover { background: var(--accent-soft); }
 .p-적자전환 { background: var(--warn-soft); color: var(--warn); }
 .p-적자지속 { background: var(--bad-soft); color: var(--bad); }
 .p-없음 { background: var(--line); color: var(--muted); }
-.flags { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-start; white-space: normal; min-width: 160px; }
+.flags { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-start; white-space: normal; min-width: 260px; max-width: 420px; }
 .flag { font-size: 0.75rem; padding: 1px 6px; border-radius: 4px; background: var(--warn-soft); color: var(--warn); }
 .empty { padding: 28px; text-align: center; color: var(--muted); }
 .vol { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; border: 1px solid var(--line);
@@ -81,6 +81,7 @@ tbody tr:hover { background: var(--accent-soft); }
 .kinds label { display: flex; gap: 6px; align-items: center; color: var(--muted); cursor: pointer; }
 .kinds b { font-family: var(--mono); font-weight: 500; color: var(--fg); }
 .kinds input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.kind.foreign { background: transparent; border: 1px solid var(--line); }
 .kind { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 4px; font-size: 0.72rem;
   background: var(--accent-soft); color: var(--accent); vertical-align: 1px; }
 footer { color: var(--muted); font-size: 0.85rem; display: grid; gap: 4px; max-width: 80ch; }
@@ -121,6 +122,12 @@ footer { color: var(--muted); font-size: 0.85rem; display: grid; gap: 4px; max-w
     <label for="k-fund"><input type="checkbox" id="k-fund" data-kind="펀드" checked> 펀드·신탁·리츠 <b id="n-fund"></b></label>
   </fieldset>
 
+  <fieldset class="kinds" id="regions" hidden>
+    <legend>공시</legend>
+    <label for="r-us"><input type="checkbox" id="r-us" data-region="us" checked> 미국 기업 (10-K·10-Q) <b id="n-us"></b></label>
+    <label for="r-foreign"><input type="checkbox" id="r-foreign" data-region="foreign" checked> 해외 기업 (20-F·40-F) <b id="n-foreign"></b></label>
+  </fieldset>
+
   <div class="vol" role="group" aria-labelledby="vol-label">
     <span class="vol-label" id="vol-label">하루 거래대금 최소</span>
     <div class="presets" id="presets"></div>
@@ -141,7 +148,9 @@ footer { color: var(--muted); font-size: 0.85rem; display: grid; gap: 4px; max-w
     <div id="asof"></div>
     <div>순이익 상태는 3년 전과 비교 (흑자 → 흑자 = 흑자, 적자 → 흑자 = 흑자전환 등). 금액 단위: 한국 억 원, 미국 백만 달러.</div>
     <div>거래대금은 주가 기준일까지 최근 3개월 하루 평균입니다 (한국: KRX 일별 거래대금, 미국: 월봉 VWAP × 거래량 ÷ 거래일). 단위: 한국 백만 원, 미국 천 달러.</div>
-    <div>미국 확인 필요 표시: 재무가 180일 넘게 지남 · 주식수 기준일 이후 분할·병합을 반영함 (1:100 넘으면 주식수 미확인) · 우선주가 장부가로만 공시됨 · 주식 종류별로 시가총액을 계산함 · 이어 쓰던 주식수를 표지 원문 값으로 바꿈 · 시가총액 $1M 미만 · 전환우선주를 보통주로 바꾸면 비율이 2/3을 넘음.</div>
+    <div>미국 확인 필요 표시: 재무가 180일 넘게 지남 · 주식수 기준일 이후 분할·병합을 반영함 (1:100 넘으면 주식수 미확인) · 우선주가 장부가로만 공시됨 · 주식 종류별로 시가총액을 계산함 · 이어 쓰던 주식수를 표지 원문 값으로 바꿈 · 시가총액 $1M 미만 · 전환우선주를 보통주로 바꾸면 비율이 2/3을 넘음 · 비율 0.01 미만(주식수·단위 오류 가능).</div>
+    <div>해외 기업(20-F·40-F): 금액은 기간 말 환율로 달러 환산, 주식수는 최신 연간 공시 표지 값을 ADS 단위로 바꿈 (이름 옆에 ADS 비율).
+      연간만 공시하는 회사가 많아 재무와 주식수가 오래됨. 확인 필요 표시: ADS 비율을 표지에서 못 읽음 · 주식수가 가중평균(단위 오류 가능).</div>
   </footer>
 </div>
 
@@ -237,8 +246,14 @@ function render() {
   const shown = new Set([...document.querySelectorAll("#kinds input:checked")].map(i => i.dataset.kind));
   const kindCount = k => all.filter(r => (r.kind || "") === k).length;
   [["company", ""], ["spac", "SPAC"], ["etf", "ETF"], ["fund", "펀드"]].forEach(([id, k]) => $(`n-${id}`).textContent = kindCount(k));
+  const hasForeign = all.some(r => r.foreign);
+  $("regions").hidden = !hasForeign;
+  const regions = new Set([...document.querySelectorAll("#regions input:checked")].map(i => i.dataset.region));
+  $("n-us").textContent = all.filter(r => !r.foreign).length;
+  $("n-foreign").textContent = all.filter(r => r.foreign).length;
   let rows = all.filter(r => (!q || r.name.toLowerCase().includes(q) || r.code.toLowerCase().includes(q))
-    && (!st || r.status === st) && (!noflag || !r.flags.length) && (r.vol || 0) >= minVol && shown.has(r.kind || ""));
+    && (!st || r.status === st) && (!noflag || !r.flags.length) && (r.vol || 0) >= minVol && shown.has(r.kind || "")
+    && (!hasForeign || regions.has(r.foreign ? "foreign" : "us")));
   $("vol-hint").textContent = minVol
     ? `하루 ${state.minvol[cur].toLocaleString("ko-KR")} ${VOL[cur].unit} 이상: ${volOk} / ${all.length}종목 (최근 3개월 평균)`
     : `최근 3개월 하루 평균 거래대금 기준. 버튼을 누르거나 금액을 직접 입력하세요.`;
@@ -257,6 +272,7 @@ function render() {
     `적자전환·적자지속 <strong>${(counts["적자전환"] || 0) + (counts["적자지속"] || 0)}</strong>`,
     ...(counts["없음"] ? [`순이익 비교 불가 <strong>${counts["없음"]}</strong>`] : []),
     ...(cur === "USD" ? [`확인 필요 <strong>${flagged}</strong>`] : []),
+    ...(all.some(r => r.foreign) ? [`해외 기업 <strong>${all.filter(r => r.foreign).length}</strong>`] : []),
     `중앙값 비율 <strong>${median(all.map(r => r.ratio)).toFixed(2)}</strong>`,
   ].map(s => `<span>${s}</span>`).join("");
   $("asof").textContent = `${d.label}: ${d.asof}`;
@@ -264,8 +280,8 @@ function render() {
   const max = 2 / 3;
   $("body").innerHTML = rows.length ? rows.map(r => `<tr>
     <td class="rank">${r.rank}</td>
-    <td class="l name">${esc(r.name)}<span class="code">${esc(r.code)}</span>${r.kind ? `<span class="kind">${esc(r.kind)}</span>` : ""}</td>
-    <td><div class="ratio"><span class="num">${r.ratio?.toFixed(3) ?? "–"}</span><span class="bar" title="2/3 기준 대비"><i style="width:${Math.min(100, (r.ratio ?? 0) / max * 100)}%"></i></span></div></td>
+    <td class="l name">${esc(r.name)}<span class="code">${esc(r.code)}</span>${r.kind ? `<span class="kind">${esc(r.kind)}</span>` : ""}${r.foreign ? `<span class="kind foreign">${esc(r.foreign)}</span>` : ""}</td>
+    <td><div class="ratio"><span class="num">${r.ratio == null ? "–" : r.ratio < 0.001 ? "&lt;0.001" : r.ratio.toFixed(3)}</span><span class="bar" title="2/3 기준 대비"><i style="width:${Math.min(100, (r.ratio ?? 0) / max * 100)}%"></i></span></div></td>
     <td>${price(r.price, cur)}</td>
     <td>${price(r.ncavps, cur)}</td>
     <td>${money(r.mcap, cur)}</td>
@@ -280,6 +296,13 @@ function median(a) { const s = a.filter(x => x != null).sort((x, y) => x - y); r
 
 ["q", "status", "noflag"].forEach(id => $(id).addEventListener("input", render));
 $("minvol").addEventListener("input", e => setMinVol(parseFloat(e.target.value)));
+document.querySelectorAll("#regions input").forEach(i => {
+  try { const saved = JSON.parse(localStorage.getItem("nn-regions")); if (saved && i.dataset.region in saved) i.checked = saved[i.dataset.region]; } catch (e) {}
+  i.addEventListener("change", () => {
+    try { localStorage.setItem("nn-regions", JSON.stringify(Object.fromEntries([...document.querySelectorAll("#regions input")].map(x => [x.dataset.region, x.checked])))); } catch (e) {}
+    render();
+  });
+});
 document.querySelectorAll("#kinds input").forEach(i => {
   try { const saved = JSON.parse(localStorage.getItem("nn-kinds")); if (saved && i.dataset.kind in saved) i.checked = saved[i.dataset.kind]; } catch (e) {}
   i.addEventListener("change", () => {
