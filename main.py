@@ -26,6 +26,7 @@
     python main.py fill-edgar-ends               # 글자별 결과에 보고기간 종료일 열 추가 (값은 그대로)
     python main.py fill-edgar-balance            # 글자별 결과의 발행주식수·우선주·비지배지분·주당순유동자산만 다시 계산 (나머지 열은 그대로)
     python main.py analyze-foreign-batch         # 해외 기업(20-F·40-F) → edgar/해외_분기.csv, 해외_연간.csv (달러 환산)
+    python main.py foreign-share-check 2026-09   # 해외 결과 중 확인 필요 종목의 표지 뒤 공시에서 발행주식수 문장 찾기 (검토용)
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
     python main.py us-prices                     # 미국 월별 주가 (Alpaca, 2016년부터) → edgar/주가_월별.csv
 
@@ -417,7 +418,7 @@ def fill_edgar_ends(edgar: EdgarClient, workers: int = 6) -> None:
 
 
 EDGAR_BALANCE_COLUMNS = {  # 지금 규칙으로 다시 계산하는 열: 앞 열 → 그 뒤에 둘 열
-    "총부채": ["우선주", "우선주_출처", "비지배지분"],
+    "총부채": ["총부채_출처", "우선주", "우선주_출처", "비지배지분"],
     "발행주식수": ["발행주식수_출처", "발행주식수_기준일"],  # 분기표만
 }
 
@@ -425,12 +426,12 @@ EDGAR_BALANCE_COLUMNS = {  # 지금 규칙으로 다시 계산하는 열: 앞 �
 def fill_edgar_balance(edgar: EdgarClient, workers: int = 6) -> None:
     """글자별 일괄 결과(연간·분기)의 재무상태표 파생 열만 지금 규칙으로 다시 계산한다. 나머지 열(채운 자사주매입)은 그대로.
 
-    다시 계산하는 열: 우선주(·우선주_출처)·비지배지분, 발행주식수(분기표는 '발행주식수_출처'·'발행주식수_기준일'), 주당순유동자산.
+    다시 계산하는 열: 총부채(없으면 부채와자본총계 − 자본총계, 총부채_출처)·우선주(·우선주_출처)·비지배지분, 발행주식수(분기표는 '발행주식수_출처'·'발행주식수_기준일'), 주당순유동자산.
     - 발행주식수: 표지 값이 없는 분기는 3개월 가중평균, 둘 다 없으면 직전 값을 최대 3분기까지
     - 주당순유동자산 = (유동자산 − 총부채 − 우선주 − 비지배지분) ÷ 발행주식수
     """
     ciks = {c["ticker"]: c["cik"] for c in edgar.tickers()}
-    redone = ["우선주", "우선주_출처", "비지배지분", "발행주식수", "발행주식수_출처", "발행주식수_기준일", "주당순유동자산"]
+    redone = ["총부채_출처", "우선주", "우선주_출처", "비지배지분", "발행주식수", "발행주식수_출처", "발행주식수_기준일", "주당순유동자산"]
 
     def tables(cik):
         quarters, annual = analysis.edgar_records(edgar.company_facts(cik))
@@ -451,12 +452,12 @@ def fill_edgar_balance(edgar: EdgarClient, workers: int = 6) -> None:
                 if new is None:  # 지금 companyfacts에 없는 기간: 원래 값 유지
                     stats["못 찾은 행"] += 1
                     new = r
-                for col in ("발행주식수", "주당순유동자산"):
+                for col in ("총부채", "발행주식수", "주당순유동자산"):
                     if str(new.get(col) if new.get(col) is not None else "") != r.get(col, ""):
                         stats[f"{key} {col} 바뀜"] += 1
                 out = {}
                 for k, v in r.items():  # 원래 열 순서를 따르고, 다시 계산한 열은 정해진 자리에 넣음
-                    if k in ("발행주식수", "주당순유동자산"):
+                    if k in ("총부채", "발행주식수", "주당순유동자산"):
                         out[k] = new.get(k)
                     elif k not in redone:
                         out[k] = v
@@ -949,6 +950,59 @@ def _split_ratio(text: str) -> float:
     return float(a) / float(b)
 
 
+SPLIT_RATIO_TAGS = ["StockholdersEquityNoteStockSplitConversionRatio1", "StockholdersEquityNoteStockSplitConversionRatio"]
+
+
+def _split_ratio_facts(ciks: list[str], workers: int = 6) -> dict:
+    """주식분할 확인 자료. 반환: {CIK: {"ratios": [(날짜, 비율)], "weighted": [(종료일, 제출일, 값)]}}
+    (data/cache/edgar_split_ratios.json에 저장).
+    - ratios: 회사가 XBRL(us-gaap)에 적은 분할 비율 (AAPL: 2014-06-06 7, 2020-08-28 4). 병합은 0.1·10 둘 다 있다.
+    - weighted: 1년 가중평균 주식수의 공시별 값. 분할이 있으면 뒤 공시가 과거 기간 값을 분할 비율만큼 소급해 고친다."""
+    path = DATA_DIR / "cache/edgar_split_ratios.json"
+    cache = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    todo = [c for c in ciks if not isinstance(cache.get(c), dict)]
+    if todo:
+        edgar = EdgarClient(os.getenv("EDGAR_USER_AGENT", ""))
+
+        def one(cik):
+            try:
+                facts = edgar.company_facts(cik).get("facts", {}).get("us-gaap", {})
+            except requests.HTTPError:
+                return {"ratios": [], "weighted": []}
+            ratios = sorted({(e["end"], e["val"]) for tag in SPLIT_RATIO_TAGS
+                             for es in facts.get(tag, {}).get("units", {}).values() for e in es if e.get("val")})
+            weighted = sorted({(e["end"], e["filed"], e["val"])
+                               for e in facts.get("WeightedAverageNumberOfSharesOutstandingBasic", {}).get("units", {})
+                               .get("shares", []) if "start" in e and 350 <= analysis._days(e) <= 380 and e["val"] > 0})
+            return {"ratios": ratios, "weighted": weighted}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            cache |= dict(zip(todo, pool.map(one, todo)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache), encoding="utf-8")
+    return {c: cache.get(c, {"ratios": [], "weighted": []}) for c in ciks}
+
+
+def _split_confirmed(facts: dict, after: str, ratio: float) -> str:
+    """분할 탐지(주식수 기준일 after에 배율 ratio)가 확인되면 근거, 아니면 ''.
+    1) 회사가 적은 분할 비율이 ±400일 안에 같은 값(±3%, 병합은 역수도) 2) 같은 과거 기간의 1년 가중평균 주식수를
+    after 전 공시와 뒤 공시(3년 안)가 배율만큼(±3%) 다르게 적음 (분할은 소급 수정, 증자는 안 고침)."""
+    d_after = date.fromisoformat(after)
+    for d, r in facts["ratios"]:
+        if abs((date.fromisoformat(d) - d_after).days) <= 400 and any(abs(v / ratio - 1) <= 0.03 for v in (r, 1 / r) if v > 0):
+            return "XBRL 분할 비율"
+    by_end = {}
+    for end, filed, val in facts["weighted"]:
+        by_end.setdefault(end, []).append((filed, val))
+    for end, values in by_end.items():
+        if end >= after:
+            continue
+        before = [v for f, v in values if f <= after]
+        later = [v for f, v in values if after < f <= (d_after + timedelta(days=1100)).isoformat()]
+        if any(abs(l / b / ratio - 1) <= 0.03 for b in before for l in later):
+            return "과거 가중평균 소급 수정"
+    return ""
+
+
 def adjust_splits() -> None:
     """과거 발행주식수·주당순유동자산을 지금 주식 기준(분할 반영)으로 바꾼 열을 더한다. 원래 열은 그대로.
 
@@ -956,7 +1010,8 @@ def adjust_splits() -> None:
       (종가 비 × 배율이 1/1.6~1.6) 시가총액은 거의 그대로(1/1.6~1.6). 유상증자·합병은 시가총액이 같이 늘어 빠진다.
       검증 결과: data/analysis/splits_dart_검증.csv. 배율 = 그 기간 뒤 검증된 분할 배율의 곱.
     미국: Alpaca 분할배율 f(월) = 원래 ÷ 분할 반영 종가 (그 달 이후 분할의 누적). 배율 = f(발행주식수_기준일이 든 달).
-      2016년 이전은 주가가 없어 2016년 1월의 f × 그 사이 detect-splits 탐지 배율(주가 검증 없음) (`분할반영_범위` 열).
+      2016년 이전은 주가가 없어 2016년 1월의 f × 그 사이 detect-splits 탐지 배율 중 XBRL로 확인된 것 (_split_confirmed)
+      (`분할반영_범위` 열).
     대상: dart/batch_상장사_{분기,연간}.csv, edgar/{분기,연간}.csv. analyze-dart-batch·merge-edgar 뒤에 다시 실행해야 한다.
     """
     num = analysis._num
@@ -1033,13 +1088,23 @@ def adjust_splits() -> None:
     eq, ea = DATA_DIR / "analysis/edgar/분기.csv", DATA_DIR / "analysis/edgar/연간.csv"
     q_rows = _load_csv(eq)
     basis = {(r["티커"], r["기간"]): r.get("발행주식수_기준일") or r["종료일"] for r in q_rows}
-    # 2016년 이전(주가 없음)은 detect-splits 탐지값을 쓴다 (주식수가 정수배로 바뀐 지점, 주식수 출처가 같은 경우만. 주가 검증 없음)
-    early = {}
+    # 2016년 이전(주가 없음)은 detect-splits 탐지값 중 회사가 XBRL에 적은 분할 비율로 확인된 것만 쓴다
+    # (주식수가 정수배로 바뀐 지점은 증자·합병일 수도 있음. 확인: 같은 비율(±3%, 병합은 역수도)이 ±400일 안에 있음)
+    cik_of = {r["티커"]: r["CIK"] for r in q_rows if r.get("CIK")}
+    candidates = []
     for c in _load_csv(DATA_DIR / "analysis/splits_edgar.csv"):
         after = basis.get((c["티커"], c["이후기간"]), "")
         fs = factor.get(c["티커"])
         if after and "→" not in c.get("주식수출처", "") and (not fs or after[:7] < min(fs)):
-            early.setdefault(c["티커"], []).append((after, _split_ratio(c["배율"])))
+            candidates.append((c["티커"], after, _split_ratio(c["배율"])))
+    disclosed = _split_ratio_facts(sorted({cik_of[t] for t, _, _ in candidates if t in cik_of}))
+    early, how = {}, Counter()
+    for t, after, ratio in candidates:
+        reason = _split_confirmed(disclosed.get(cik_of.get(t), {"ratios": [], "weighted": []}), after, ratio)
+        how[reason or "확인 안 됨(제외)"] += 1
+        if reason:
+            early.setdefault(t, []).append((after, ratio))
+    print(f"미국 2016년 이전 분할 탐지 {len(candidates)}건: " + ", ".join(f"{k} {v}" for k, v in how.most_common()))
 
     def us_date(r):
         return (basis.get((r["티커"], r["기간"])) if "기간" in r else basis.get((r["티커"], f"{r['연도']}Q4"))) or r.get("종료일") or ""
@@ -1060,7 +1125,7 @@ def adjust_splits() -> None:
         fs = factor.get(r["티커"], {})
         if not fs or us_date(r)[:7] >= min(fs):
             return "전체"
-        return "2016년 이전은 탐지값(주가 검증 없음)" if early.get(r["티커"]) else "2016년 이후 분할만"
+        return "2016년 이전은 XBRL로 확인한 탐지값" if early.get(r["티커"]) else "2016년 이후 분할만"
 
     save(eq, add_columns(q_rows, us_ratio, us_scope))
     a_rows = _load_csv(ea)
@@ -1385,6 +1450,107 @@ def _split_adjust(latest: dict, market: dict, prices: list[dict], month: str) ->
     return notes
 
 
+SHARE_STATEMENT = re.compile(
+    r"(?:there\s+(?:were|are)\s+)?(\d{1,3}(?:,\d{3})+)\s+(?:of\s+our\s+)?(?:class\s+([ab])\s+)?(?:ordinary|common)\s+shares"
+    r"(?:\s*,\s*[\w\s$.]{0,40}?,)?\s+(?:were\s+|are\s+)?(?:issued\s+and\s+)?outstanding", re.I)
+AS_OF = re.compile(r"(?:[Aa]s\s+of|[Oo]n)\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})")
+TWO_CLASS_STATEMENT = re.compile(  # 'X Class A ordinary shares and Y Class B ordinary shares ... outstanding'
+    r"(\d{1,3}(?:,\d{3})+)\s+class\s+a\s+ordinary\s+shares[^.]{0,80}?\s+and\s+(\d{1,3}(?:,\d{3})+)\s+class\s+b\s+"
+    r"ordinary\s+shares[^.]{0,80}?outstanding", re.I)
+SHARE_FORMS = ("6-K", "6-K/A", "424B1", "424B3", "424B4", "424B5", "F-1", "F-1/A", "F-3", "F-3/A", "20-F", "20-F/A")
+
+
+def foreign_share_check(month: str, workers: int = 6) -> None:
+    """screen-edgar 결과의 해외 기업 중 확인 필요 종목(표지 뒤 병합, 비율 0.01 미만, 재무 270일 초과, 가중평균 주식수)에 대해
+    표지 날짜 뒤 공시(6-K·424B·F-1·F-3·20-F) 본문에서 '...ordinary shares ... outstanding' 문장과 그 근처 'as of 날짜'를 모은다.
+    결과: analysis/edgar/해외_주식수_후보_<월>.csv (티커, 공시, 제출일, 기준일, 주식수, 종류, 문장). 사람이 보고 manual_shares.csv에 옮긴다.
+    """
+    import html as html_lib
+    from datetime import datetime
+    edgar = EdgarClient(os.getenv("EDGAR_USER_AGENT", ""))
+    rows = [r for r in _load_csv(DATA_DIR / f"analysis/edgar/screen_{month}.csv") if r.get("해외")]
+    year, mon = int(month[:4]), int(month[5:7])
+    as_of = (date(year + mon // 12, mon % 12 + 1, 1) - timedelta(days=1)).isoformat()
+
+    def needs(r):
+        merge = "×" in r["분할보정"] and float(r["분할보정"].split("×")[1]) < 0.5
+        return (merge or float(r["시총÷순유동자산"]) < 0.01 or int(r["재무경과일"]) > 270
+                or r["발행주식수_출처"].startswith("가중평균"))
+
+    def one(r):
+        since = r["발행주식수_기준일"] or r["종료일"]
+        found = []
+        filings = [f for f in edgar.filings(r["CIK"], SHARE_FORMS) if since < f["filingDate"] <= as_of]
+        for f in sorted(filings, key=lambda f: f["filingDate"], reverse=True)[:12]:
+            base = f"https://www.sec.gov/Archives/edgar/data/{int(r['CIK'])}/{f['accessionNumber'].replace('-', '')}"
+            try:
+                items = edgar._get_json(f"{base}/index.json")["directory"]["item"]
+            except Exception:
+                continue
+            docs = [i["name"] for i in items if i["name"].lower().endswith((".htm", ".html"))
+                    and not i["name"].lower().startswith("r") and int(i.get("size") or 0) < 3_000_000][:4]
+            for name in docs:
+                try:
+                    raw = edgar._get(f"{base}/{name}", timeout=60).text
+                except Exception:
+                    continue
+                text = re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", raw)))
+                matches = [(m, m.group(1).replace(",", ""), (m.group(2) or "").upper()) for m in SHARE_STATEMENT.finditer(text)]
+                matches += [(m, str(int(m.group(1).replace(",", "")) + int(m.group(2).replace(",", ""))), "A+B")
+                            for m in TWO_CLASS_STATEMENT.finditer(text)]
+                for m, shares, kind in matches:
+                    window = text[max(0, m.start() - 250): m.end() + 150]
+                    dates = []
+                    for d in AS_OF.findall(window):
+                        try:
+                            dates.append(datetime.strptime(d.replace("  ", " "), "%B %d, %Y").date().isoformat())
+                        except ValueError:
+                            pass
+                    found.append({"티커": r["티커"], "공시": f["form"], "제출일": f["filingDate"], "문서": f"{base}/{name}",
+                                  "기준일": max(dates) if dates else "", "주식수": shares,
+                                  "종류": kind, "문장": window.strip()[:400]})
+        return found
+
+    targets = [r for r in rows if needs(r)]
+    print(f"해외 결과 {len(rows)}종목 중 확인 대상 {len(targets)}종목", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = [x for xs in pool.map(one, targets) for x in xs]
+    # 같은 (티커, 기준일, 주식수, 종류)는 최신 공시 하나만
+    seen, out = set(), []
+    for x in sorted(results, key=lambda x: (x["티커"], x["기준일"], x["제출일"]), reverse=True):
+        key = (x["티커"], x["기준일"], x["주식수"], x["종류"])
+        if key not in seen:
+            seen.add(key)
+            out.append(x)
+    save_csv(f"analysis/edgar/해외_주식수_후보_{month}.csv", out, ["티커", "공시", "제출일", "기준일", "주식수", "종류", "문서", "문장"])
+    print(f"주식수 문장을 찾은 종목 {len({x['티커'] for x in out})} / {len(targets)}")
+
+
+# 미국 종류: SPAC / ETF / 펀드 (투자회사·신탁·리츠). SEC 업종 코드(SIC) 우선, 없으면 이름. 나머지는 일반 기업("")
+US_SIC_KIND = {"6770": "SPAC", "6221": "ETF", "6722": "펀드", "6726": "펀드", "6798": "펀드"}
+US_NAME_KIND = [(re.compile(r"\bAcquisition (Corp|Co|Company|Holdings)\b|\bSPAC\b", re.I), "SPAC"),
+                (re.compile(r"\bETF\b|\bETN\b", re.I), "ETF"),
+                (re.compile(r"\b(Fund|Trust)\b", re.I), "펀드")]
+
+
+def us_kinds(rows) -> dict:
+    """CIK → 종류. rows: CIK·회사명 열이 있는 행. SIC는 data/cache/edgar_sic.json에 저장해 두고 재사용."""
+    cache_path = DATA_DIR / "cache/edgar_sic.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    edgar = None
+    out = {}
+    for r in rows:
+        cik = r["CIK"]
+        if cik not in cache:
+            edgar = edgar or EdgarClient(os.getenv("EDGAR_USER_AGENT", ""))
+            sub = edgar.submissions(cik)
+            cache[cik] = [sub.get("sic") or "", sub.get("sicDescription") or ""]
+        out[cik] = US_SIC_KIND.get(cache[cik][0]) or next((k for pat, k in US_NAME_KIND if pat.search(r["회사명"])), "")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    return out
+
+
 FOREIGN_MAX_AGE = 550  # 해외 기업 재무 종료일이 기준일보다 이만큼(일) 넘게 오래되면 제외 (20-F 연간 + 제출기한 4개월 + 여유)
 
 
@@ -1467,6 +1633,10 @@ def screen_edgar(args: list[str]) -> None:
     passed, stages = analysis.screen_net_net(rows, "기준", market, max_ratio, profit_years,
                                              None if "--no-profit" in args else set(opt("--profit", "흑자,흑자전환").split(",")),
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
+    if "--no-buyback" not in args:  # ETF·펀드·신탁의 환매는 자사주매입이 아님 → 매입 증가 조건에서 뺀다
+        kinds = us_kinds([{"CIK": latest[p["종목코드"]]["CIK"], "회사명": p["회사명"]} for p in passed])
+        passed = [p for p in passed if kinds[latest[p["종목코드"]]["CIK"]] not in ("ETF", "펀드")]
+        stages["자사주매입증가(ETF·펀드 환매 제외)"] = len(passed)
     for name, count in stages.items():
         print(f"  {name}: {count}")
     factor = {(r["티커"], r["월"]): float(r["종가"]) / float(r["종가(분할반영)"])
@@ -1725,6 +1895,9 @@ def main(argv: list[str]) -> None:
             return [int(y) for y in rest[:next((i for i, a in enumerate(rest) if a.startswith("--")), len(rest))]]
         analyze_dart_batch(DartClient(os.getenv("DART_API_KEY", "")), int(args[0]), int(args[1]),
                            years_after("--buyback"), years_after("--buyback-quarterly"))
+
+    elif cmd == "foreign-share-check":
+        foreign_share_check(args[0])
 
     elif cmd == "analyze-foreign-batch":
         analyze_foreign_batch(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))

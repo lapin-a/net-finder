@@ -14,7 +14,8 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 
-BALANCE_KEYS = ("current_assets", "total_liabilities", "shares", "preferred", "preferred_source", "minority")
+BALANCE_KEYS = ("current_assets", "total_liabilities", "liabilities_source", "shares", "preferred", "preferred_source",
+                "minority")
 
 
 # ---------------------------------------------------------------- 공통 유틸
@@ -86,7 +87,8 @@ def _senior_claims(rec) -> dict:
     """
     if "end" not in rec:
         return {}
-    return {"우선주": rec.get("preferred"), "우선주_출처": rec.get("preferred_source"), "비지배지분": rec.get("minority")}
+    return {"총부채_출처": rec.get("liabilities_source"),
+            "우선주": rec.get("preferred"), "우선주_출처": rec.get("preferred_source"), "비지배지분": rec.get("minority")}
 
 
 def _senior_total(rec) -> float:
@@ -373,7 +375,30 @@ EDGAR_TAGS = {
     "preferred_liquidation": ["PreferredStockLiquidationPreferenceValue"],
     "preferred_book": ["PreferredStockValue"],
     "minority": ["MinorityInterest"],
+    # 총부채(Liabilities)를 안 적는 회사가 많아 부채와자본총계 − 자본총계로 계산 (_fill_liabilities)
+    "liabilities_and_equity": ["LiabilitiesAndStockholdersEquity"],
+    "equity_total": ["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    "equity_parent": ["StockholdersEquity"],
 }
+DERIVED_LIABILITY_KEYS = ("liabilities_and_equity", "equity_total", "equity_parent")
+
+
+def _fill_liabilities(rec: dict) -> None:
+    """총부채가 없으면 부채와자본총계 − 자본총계(비지배지분 포함) − 임시자본. 지배기업 자본만 있으면 비지배지분도 뺀다.
+    rec의 계산용 키는 지우고 'liabilities_source'를 남긴다 (공시 값이면 None)."""
+    total, equity, parent = (rec.pop(k, None) for k in DERIVED_LIABILITY_KEYS)
+    rec["liabilities_source"] = None
+    if rec.get("total_liabilities") is not None or total is None:
+        return
+    temporary = rec.get("temporary_equity") or 0
+    if equity is not None:
+        value = total - equity - temporary
+    elif parent is not None:
+        value = total - parent - (rec.get("minority") or 0) - temporary
+    else:
+        return
+    if 0 <= value <= total:
+        rec["total_liabilities"], rec["liabilities_source"] = value, "부채와자본총계−자본총계"
 PREFERRED_PER_SHARE_TAGS = ["PreferredStockLiquidationPreference"]  # USD/shares
 PREFERRED_SHARES_TAGS = ["PreferredStockSharesOutstanding", "PreferredStockSharesIssued"]
 EDGAR_FLOW_UNITS = {"net_income": "USD", "buyback": "USD", "buyback_shares": "shares"}
@@ -563,10 +588,12 @@ def edgar_records(facts: dict):
         return out
 
     for key in ("current_assets", "total_liabilities", "temporary_equity", "preferred_liquidation", "preferred_book",
-                "minority"):
+                "minority", *DERIVED_LIABILITY_KEYS):
         values = {end: v for (_, end), v in latest(_edgar_entries(facts, "us-gaap", EDGAR_TAGS[key], "USD")).items()}
         for end in ends:
             quarters[periods[end]][key] = values.get(end)
+    for rec in quarters.values():
+        _fill_liabilities(rec)
     per_share = {end: v for (_, end), v in latest(_edgar_entries(facts, "us-gaap", PREFERRED_PER_SHARE_TAGS, "USD/shares")).items()}
     pref_shares = {end: v for (_, end), v in latest(_edgar_entries(facts, "us-gaap", PREFERRED_SHARES_TAGS, "shares")).items()}
     for rec in quarters.values():
@@ -647,6 +674,9 @@ IFRS_TAGS = {
     "net_income": ["ProfitLossAttributableToOwnersOfParent", "ProfitLoss"],
     "buyback": ["PaymentsToAcquireOrRedeemEntitysShares", "PurchaseOfTreasuryShares"],
     "minority": ["NoncontrollingInterests"],
+    "liabilities_and_equity": ["EquityAndLiabilities"],
+    "equity_total": ["Equity"],
+    "equity_parent": ["EquityAttributableToOwnersOfParent"],
 }
 WEIGHTED_SHARES_TAGS = {"us-gaap": ["WeightedAverageNumberOfSharesOutstandingBasic"], "ifrs-full": ["WeightedAverageShares"]}
 
@@ -734,13 +764,15 @@ def foreign_records(facts: dict, fx):
                 for end in ends}
 
     for key in ("current_assets", "total_liabilities", "temporary_equity", "preferred_liquidation", "preferred_book",
-                "minority"):
+                "minority", *DERIVED_LIABILITY_KEYS):
         values = {end: v for (_, end), v in latest(_foreign_entries(facts, taxonomy, tags.get(key, []))).items()}
         for end in ends:
             usd, rate, unit = to_usd(values.get(end, {}), end)
             quarters[periods[end]][key] = usd
             if key == "current_assets":  # 유동자산에 쓴 통화·환율 (환율이 없는 통화는 회사가 적은 달러 값 → USD)
                 quarters[periods[end]]["currency"], quarters[periods[end]]["fx"] = unit, rate
+    for rec in quarters.values():
+        _fill_liabilities(rec)
     for rec in quarters.values():  # us-gaap 회사의 우선주 (IFRS는 우선주 항목이 없어 None)
         rec["preferred"], rec["preferred_source"] = _preferred_total(
             rec.pop("temporary_equity"), rec.pop("preferred_liquidation"), rec.pop("preferred_book"), None, None)
@@ -1023,7 +1055,8 @@ def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio:
         passed.append({
             "종목코드": code, "회사명": r["회사명"], ("기간" if quarterly else "연도"): period,
             "종가": m["close"], "시가총액": m["mktcap"],
-            "유동자산": ca, "총부채": tl, **({"우선주": preferred, "우선주_출처": r.get("우선주_출처", ""), "비지배지분": minority} if "우선주" in r else {}),
+            "유동자산": ca, "총부채": tl, **({"총부채_출처": r.get("총부채_출처") or ""} if "총부채_출처" in r else {}),
+            **({"우선주": preferred, "우선주_출처": r.get("우선주_출처", ""), "비지배지분": minority} if "우선주" in r else {}),
             "순유동자산": ncav,
             "주당순유동자산": round(ncav / m["shares"], 2),
             "시총÷순유동자산": round(ratio, 3),
