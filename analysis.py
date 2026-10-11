@@ -848,6 +848,7 @@ def foreign_records(facts: dict, fx):
                 weighted[e["end"]] = (_days(e), val, e["filed"])
     for end in ends:
         rec = quarters[periods[end]]
+        rec["weighted_shares"] = weighted[end][1] if end in weighted else None  # 표지 주식수가 병합 후 기준인지 확인용
         if rec.get("shares") is None and end in weighted:
             rec["shares"], rec["shares_source"], rec["shares_date"] = weighted[end][1], "가중평균", weighted[end][2]
 

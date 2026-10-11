@@ -229,7 +229,8 @@ def analyze_foreign_batch(edgar: EdgarClient, workers: int = 6) -> None:
             quarters, annual = records
             head = {"CIK": cik, "티커": c["ticker"], "회사명": c["name"]}
             for (key, rec), row in zip(sorted(quarters.items()), analysis.quarterly_table(quarters)):
-                extra = {"제출일": rec["filed"], "통화": rec.get("currency"), "환율": rec.get("fx"), "회계기준": info}
+                extra = {"제출일": rec["filed"], "통화": rec.get("currency"), "환율": rec.get("fx"), "회계기준": info,
+                         "가중평균주식수": rec.get("weighted_shares")}
                 q_all.append({**head, "기간": row.pop("기간"), "종료일": row.pop("종료일"), **extra, **row})
             for row in analysis.annual_table(annual):
                 rec = annual[row["연도"]]
@@ -1355,11 +1356,12 @@ def _ads_ratio(edgar: EdgarClient, cik: str, ticker: str, as_of: date) -> dict:
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(found, ensure_ascii=False), encoding="utf-8")
         if found["title"]:
-            return {**found, "accn": f["accessionNumber"]}
+            return {**found, "accn": f["accessionNumber"], "filed": f["filingDate"]}
     return {"ratio": None, "title": None, "classes": [], "accn": None}
 
 
-def _apply_ads(edgar: EdgarClient, latest: dict, market: dict, foreign: set, as_of: date, manual_shares=()) -> dict:
+def _apply_ads(edgar: EdgarClient, latest: dict, market: dict, foreign: set, as_of: date, manual_shares=(),
+               factor=None) -> dict:
     """해외 기업의 발행주식수(원주)를 상장 증권(ADS) 단위로 바꾼다 (market을 고쳐 씀). 순유동자산이 양수인 회사만.
 
     먼저 최신 20-F·40-F 표지 XBRL의 종류별 주식수(우선주 제외 합)가 분기표 값보다 새것이거나 분기표 값이 가중평균이면 그 값을 쓴다.
@@ -1370,6 +1372,7 @@ def _apply_ads(edgar: EdgarClient, latest: dict, market: dict, foreign: set, as_
     반환: {티커: {"ratio": 쓴 비율, "note": 설명}}
     """
     num = analysis._num
+    factor = factor or {}  # (티커, 월) → Alpaca 분할배율
     path = DATA_DIR.parent / "manual_shares.csv"
     manual = {m["티커"]: (float(m["ADS비율"]), m["출처"]) for m in (_load_csv(path) if path.exists() else [])
               if m.get("ADS비율") and m["기준일"] <= as_of.isoformat()}
@@ -1393,11 +1396,25 @@ def _apply_ads(edgar: EdgarClient, latest: dict, market: dict, foreign: set, as_
         cover_date = max((c["date"] for c in classes if c["date"]), default="")
         # 같은 연간 공시라도 companyfacts에는 종류 하나만 잡히는 회사가 있어(GENI 1,000만 주 vs 표지 합 2.6억 주)
         # 표지 원문이 같은 날짜 이후면 원문 합을 쓴다
+        # 가중평균은 기준일이 제출일이라 표지 날짜(기간 말)보다 늦지만, 기간 말 실제 주식수가 더 정확하다
+        # (기간 중 대량 발행을 덜 반영: TC 가중평균 5.7억 vs 표지 83억 주) → 표지 날짜가 그 기간 말 이후면 표지 값
+        weighted = (r.get("발행주식수_출처") or "").startswith("가중평균") and cover_date >= r["종료일"]
         if (classes and t not in manual_shares and cover_date <= as_of.isoformat()
-                and cover_date >= (r.get("발행주식수_기준일") or "")):
+                and (cover_date >= (r.get("발행주식수_기준일") or "") or weighted)):
             shares = sum(c["shares"] for c in classes)
             market[t] = {**market[t], "shares": shares, "mktcap": shares * market[t]["close"]}
-            r["발행주식수_출처"], r["발행주식수_기준일"] = "연간 공시 표지", cover_date
+            r["발행주식수_출처"], r["발행주식수_기준일"], r["_공시제출일"] = "연간 공시 표지", cover_date, f.get("filed")
+        # 표지 날짜와 공시 제출일 사이에 병합·분할이 있으면 표지 주식수가 이미 그 뒤 기준으로 고쳐 적혀 있을 수 있다
+        # (LHSW: 3/31 표지 331만 주, 6월 1:16 병합, 8/13 제출 → 331만 주는 병합 후 기준). 가중평균(소급 수정이 원칙)과
+        # 1/3~3배 안이면 고쳐 적은 값으로 보고 기준일을 제출일로 → 그 사이 병합을 두 번 반영하지 않는다
+        d, filed = r.get("발행주식수_기준일") or "", r.get("_공시제출일") or r.get("제출일") or ""
+        f_d, f_filed = factor.get((t, d[:7])), factor.get((t, filed[:7]))
+        weighted_shares = num(r.get("가중평균주식수"))
+        if (d and filed > d and f_d and f_filed and abs(f_d / f_filed - 1) > 0.01 and weighted_shares
+                and r.get("발행주식수_출처") in ("표지", "연간 공시 표지")
+                and 1 / 3 <= market[t]["shares"] / weighted_shares <= 3):
+            r["발행주식수_기준일"] = filed
+            r["발행주식수_출처"] += " (제출 전 병합·분할 반영된 값)"
         parsed = analysis.ads_ratio_from_title(f["title"]) if f["title"] else None  # 캐시의 ratio 대신 지금 규칙으로
         if t in manual:
             ratio, note = manual[t][0], f"수동: {manual[t][1]}"
@@ -1635,7 +1652,9 @@ def screen_edgar(args: list[str]) -> None:
     class_notes = _class_market_caps(edgar, latest, market, close, others, month)
     manual_notes = _manual_shares(latest, market, close, as_of)
     class_notes |= manual_notes
-    ads = _apply_ads(edgar, latest, market, foreign, as_of, manual_notes)
+    split_factor = {(r["티커"], r["월"]): float(r["종가"]) / float(r["종가(분할반영)"])
+                    for r in prices if r["종가"] and r["종가(분할반영)"] and float(r["종가(분할반영)"]) > 0}
+    ads = _apply_ads(edgar, latest, market, foreign, as_of, manual_notes, split_factor)
     split_notes = _split_adjust(latest, market, prices, month)
     max_ratio = float(opt("--ratio", 2 / 3))
     profit_years = int(opt("--profit-years", 3))
