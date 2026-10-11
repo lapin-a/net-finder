@@ -179,6 +179,15 @@ python main.py screen-edgar --lag 60 --ratio 1
 
 → `data/analysis/edgar/screen_<기준월>.csv` (시총÷순유동자산이 낮은 순)
 
+### 목록 페이지
+
+```bash
+python report/build_page.py   # 스크리너 결과 → data/analysis/netnet_candidates.html
+```
+
+한국 2026Q2·2025, 미국 2026-09 결과를 탭으로 보여 주고, 검색·순이익 상태·확인 필요 표시·최소 거래대금(버튼 또는 직접 입력)으로 거를 수 있습니다.
+거래대금은 주가 기준일까지 최근 3개월 하루 평균 (한국 KRX 일별 거래대금, 미국 Alpaca 월봉 VWAP × 거래량 ÷ 거래일).
+
 ### 원본 데이터
 
 ```bash

@@ -1,0 +1,265 @@
+<title>넷넷 후보 종목</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* 레이아웃: 위에 기준·요약, 아래에 시장별 탭 + 종목표 (비율 막대로 2/3 기준선까지 얼마나 싼지 표시) */
+:root {
+  --bg: #f6f7f8; --surface: #ffffff; --fg: #1b2127; --muted: #5d6873; --line: #dde2e7;
+  --accent: #0f6b62; --accent-soft: #d9ece9; --warn: #9a5b00; --warn-soft: #fbefd9;
+  --bad: #a3313b; --bad-soft: #f7e1e3; --good: #23744a; --good-soft: #dff0e6;
+  --sans: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Consolas", monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12161a; --surface: #1a2026; --fg: #e4e8ec; --muted: #9aa5b0; --line: #2c343c;
+  --accent: #4fc2b4; --accent-soft: #173a36; --warn: #e7b05a; --warn-soft: #3a2d17;
+  --bad: #ec8a92; --bad-soft: #3d2124; --good: #74cf9d; --good-soft: #1b3426; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12161a; --surface: #1a2026; --fg: #e4e8ec; --muted: #9aa5b0; --line: #2c343c;
+  --accent: #4fc2b4; --accent-soft: #173a36; --warn: #e7b05a; --warn-soft: #3a2d17;
+  --bad: #ec8a92; --bad-soft: #3d2124; --good: #74cf9d; --good-soft: #1b3426; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.55; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 48px; display: grid; gap: 22px; }
+header { display: grid; gap: 8px; }
+h1 { font-size: 1.6rem; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+.formula { font-family: var(--mono); font-size: 0.95rem; color: var(--accent); }
+.note { color: var(--muted); max-width: 70ch; margin: 0; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); }
+.tab { font: inherit; background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+  padding: 8px 12px; cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+.tab b { font-family: var(--mono); font-weight: 500; }
+.tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+.tab:focus-visible, input:focus-visible, select:focus-visible, th button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.summary { display: flex; flex-wrap: wrap; gap: 8px 22px; color: var(--muted); }
+.summary strong { color: var(--fg); font-family: var(--mono); font-weight: 500; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.controls input[type=search] { font: inherit; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); color: var(--fg); min-width: 0; width: 240px; max-width: 100%; }
+.controls label { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+.controls select { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--fg); }
+.table-box { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; min-width: 900px; font-variant-numeric: tabular-nums; }
+th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { font-size: 0.78rem; letter-spacing: 0.02em; color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--surface); }
+th button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
+th[aria-sort] button { color: var(--fg); }
+td.l, th.l { text-align: left; }
+tbody tr:hover { background: var(--accent-soft); }
+.rank { color: var(--muted); font-family: var(--mono); font-size: 0.8rem; }
+.name { font-weight: 500; white-space: normal; min-width: 180px; }
+.code { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); margin-left: 6px; }
+.num { font-family: var(--mono); }
+.neg { color: var(--bad); }
+.ratio { display: grid; grid-template-columns: 3.4em 90px; gap: 8px; align-items: center; justify-content: end; }
+.bar { height: 6px; background: var(--line); border-radius: 3px; position: relative; overflow: hidden; }
+.bar i { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 3px; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.78rem; }
+.p-흑자 { background: var(--good-soft); color: var(--good); }
+.p-흑자전환 { background: var(--good-soft); color: var(--good); }
+.p-적자전환 { background: var(--warn-soft); color: var(--warn); }
+.p-적자지속 { background: var(--bad-soft); color: var(--bad); }
+.p-없음 { background: var(--line); color: var(--muted); }
+.flags { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-start; white-space: normal; min-width: 160px; }
+.flag { font-size: 0.75rem; padding: 1px 6px; border-radius: 4px; background: var(--warn-soft); color: var(--warn); }
+.empty { padding: 28px; text-align: center; color: var(--muted); }
+.vol { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--surface); }
+.vol-label { color: var(--fg); font-weight: 500; }
+.presets { display: flex; flex-wrap: wrap; gap: 4px; }
+.preset { font: inherit; font-family: var(--mono); font-size: 0.82rem; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--muted); }
+.preset[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.preset:focus-visible, .vol input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.vol input[type=number] { font: inherit; font-family: var(--mono); width: 8.5em; padding: 6px 8px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); color: var(--fg); }
+.vol .unit { color: var(--muted); }
+.vol .hint { color: var(--muted); font-size: 0.82rem; flex-basis: 100%; }
+.novol { color: var(--muted); font-size: 0.8rem; }
+footer { color: var(--muted); font-size: 0.85rem; display: grid; gap: 4px; max-width: 80ch; }
+@media (max-width: 600px) { h1 { font-size: 1.3rem; } .controls input[type=search] { width: 100%; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>넷넷 후보 종목</h1>
+    <div class="formula">시가총액 ÷ 순유동자산 ≤ 2/3</div>
+    <p class="note">순유동자산 = 유동자산 − 총부채 (미국은 우선주·비지배지분도 뺌). 순이익·자사주매입 조건은 끄고 비율만 봤습니다.
+      비율이 낮을수록 순유동자산에 비해 싸게 거래되는 종목입니다.</p>
+  </header>
+
+  <div class="tabs" role="tablist" id="tabs"></div>
+  <div class="summary" id="summary"></div>
+
+  <div class="controls">
+    <input type="search" id="q" placeholder="회사명·코드 검색" aria-label="회사명 또는 코드 검색">
+    <label for="status">순이익 상태
+      <select id="status">
+        <option value="">전체</option>
+        <option value="흑자">흑자</option>
+        <option value="흑자전환">흑자전환</option>
+        <option value="적자전환">적자전환</option>
+        <option value="적자지속">적자지속</option>
+      </select>
+    </label>
+    <label for="noflag"><input type="checkbox" id="noflag"> 확인 필요 표시 없는 종목만</label>
+  </div>
+
+  <div class="vol" role="group" aria-labelledby="vol-label">
+    <span class="vol-label" id="vol-label">하루 거래대금 최소</span>
+    <div class="presets" id="presets"></div>
+    <label for="minvol" class="unit">직접 입력</label>
+    <input type="number" id="minvol" min="0" step="any" inputmode="decimal" placeholder="0">
+    <span class="unit" id="vol-unit">백만 원</span>
+    <span class="hint" id="vol-hint"></span>
+  </div>
+
+  <div class="table-box">
+    <table>
+      <thead><tr id="head"></tr></thead>
+      <tbody id="body"></tbody>
+    </table>
+  </div>
+
+  <footer>
+    <div id="asof"></div>
+    <div>순이익 상태는 3년 전과 비교 (흑자 → 흑자 = 흑자, 적자 → 흑자 = 흑자전환 등). 금액 단위: 한국 억 원, 미국 백만 달러.</div>
+    <div>거래대금은 주가 기준일까지 최근 3개월 하루 평균입니다 (한국: KRX 일별 거래대금, 미국: 월봉 VWAP × 거래량 ÷ 거래일). 단위: 한국 백만 원, 미국 천 달러.</div>
+    <div>미국 확인 필요 표시: 재무가 180일 넘게 지남 · 주식수 기준일 이후 분할·병합을 반영함 (1:100 넘으면 주식수 미확인) · 우선주가 장부가로만 공시됨 · 주식 종류별로 시가총액을 계산함 · 이어 쓰던 주식수를 표지 원문 값으로 바꿈 · 시가총액 $1M 미만 · 전환우선주를 보통주로 바꾸면 비율이 2/3을 넘음.</div>
+  </footer>
+</div>
+
+<script>
+const DATA = /*DATA*/null;
+const state = { tab: "krq", sort: "ratio", dir: 1, minvol: { KRW: 0, USD: 0 } };
+// 거래대금 입력 단위: 한국 백만 원, 미국 천 달러
+const VOL = {
+  KRW: { unit: "백만 원", scale: 1e6, presets: [0, 10, 50, 100, 500, 1000] },
+  USD: { unit: "천 달러", scale: 1e3, presets: [0, 10, 50, 100, 500, 1000] },
+};
+try { const m = JSON.parse(localStorage.getItem("nn-minvol")); if (m) state.minvol = { ...state.minvol, ...m }; } catch (e) {}
+try { const t = localStorage.getItem("nn-tab"); if (t && DATA[t]) state.tab = t; } catch (e) {}
+if (location.hash && DATA[location.hash.slice(1)]) state.tab = location.hash.slice(1);
+
+const cols = [
+  { key: "rank", label: "#", cls: "" },
+  { key: "name", label: "종목", cls: "l" },
+  { key: "ratio", label: "시총÷순유동자산", cls: "" },
+  { key: "price", label: "종가", cls: "" },
+  { key: "ncavps", label: "주당순유동자산", cls: "" },
+  { key: "mcap", label: "시가총액", cls: "" },
+  { key: "ncav", label: "순유동자산", cls: "" },
+  { key: "ni", label: "순이익", cls: "" },
+  { key: "vol", label: "거래대금(하루)", cls: "" },
+  { key: "status", label: "순이익 상태", cls: "l" },
+  { key: "flags", label: "확인 필요", cls: "l" },
+];
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function money(v, cur) {
+  if (v == null) return "–";
+  const x = cur === "KRW" ? v / 1e8 : v / 1e6;
+  const s = Math.abs(x) >= 100 ? Math.round(x).toLocaleString("ko-KR") : x.toLocaleString("ko-KR", { maximumFractionDigits: 1 });
+  return `<span class="num${v < 0 ? " neg" : ""}">${s}</span>`;
+}
+function price(v, cur) {
+  if (v == null) return "–";
+  return `<span class="num">${cur === "KRW" ? Math.round(v).toLocaleString("ko-KR") : "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>`;
+}
+
+function volume(v, cur) {
+  if (!v) return `<span class="novol">거래 없음</span>`;
+  const x = v / VOL[cur].scale;
+  return `<span class="num">${x >= 100 ? Math.round(x).toLocaleString("ko-KR") : x.toLocaleString("ko-KR", { maximumFractionDigits: 1 })}</span>`;
+}
+
+function renderVol() {
+  const cur = DATA[state.tab].cur, cfg = VOL[cur], cur_min = state.minvol[cur] || 0;
+  $("vol-unit").textContent = cfg.unit;
+  $("presets").innerHTML = cfg.presets.map(p =>
+    `<button type="button" class="preset" data-v="${p}" aria-pressed="${p === cur_min}">${p ? p.toLocaleString("ko-KR") : "전체"}</button>`).join("");
+  $("presets").querySelectorAll(".preset").forEach(b => b.onclick = () => setMinVol(Number(b.dataset.v)));
+  if (document.activeElement !== $("minvol")) $("minvol").value = cur_min || "";
+}
+function setMinVol(v) {
+  const cur = DATA[state.tab].cur;
+  state.minvol[cur] = Number.isFinite(v) && v > 0 ? v : 0;
+  try { localStorage.setItem("nn-minvol", JSON.stringify(state.minvol)); } catch (e) {}
+  renderVol(); render();
+}
+
+function renderTabs() {
+  $("tabs").innerHTML = Object.entries(DATA).map(([k, d]) =>
+    `<button class="tab" role="tab" id="tab-${k}" aria-selected="${k === state.tab}" data-k="${k}">${esc(d.label)} <b>${d.rows.length}</b></button>`).join("");
+  $("tabs").querySelectorAll(".tab").forEach(b => b.onclick = () => {
+    state.tab = b.dataset.k; try { localStorage.setItem("nn-tab", state.tab); } catch (e) {}
+    renderTabs(); renderVol(); render();
+  });
+}
+
+function render() {
+  const d = DATA[state.tab], cur = d.cur;
+  const unit = cur === "KRW" ? "억 원" : "$M";
+  $("head").innerHTML = cols.map(c => {
+    let label = c.label;
+    if (["mcap", "ncav", "ni"].includes(c.key)) label += ` (${unit})`;
+    if (c.key === "ni") label = `${d.niLabel} (${unit})`;
+    if (c.key === "vol") label += ` (${VOL[cur].unit})`;
+    const sorted = state.sort === c.key ? ` aria-sort="${state.dir > 0 ? "ascending" : "descending"}"` : "";
+    const sortable = !["rank", "flags"].includes(c.key);
+    return `<th class="${c.cls}"${sorted}>${sortable ? `<button data-k="${c.key}">${esc(label)}${state.sort === c.key ? (state.dir > 0 ? " ▲" : " ▼") : ""}</button>` : esc(label)}</th>`;
+  }).join("");
+  $("head").querySelectorAll("button").forEach(b => b.onclick = () => {
+    const k = b.dataset.k; state.dir = state.sort === k ? -state.dir : (k === "ratio" || k === "name" || k === "status" ? 1 : -1); state.sort = k; render();
+  });
+
+  const q = $("q").value.trim().toLowerCase(), st = $("status").value, noflag = $("noflag").checked;
+  const all = d.rows.map((r, i) => ({ ...r, rank: i + 1 }));
+  const minVol = (state.minvol[cur] || 0) * VOL[cur].scale;
+  const volOk = all.filter(r => (r.vol || 0) >= minVol).length;
+  let rows = all.filter(r => (!q || r.name.toLowerCase().includes(q) || r.code.toLowerCase().includes(q))
+    && (!st || r.status === st) && (!noflag || !r.flags.length) && (r.vol || 0) >= minVol);
+  $("vol-hint").textContent = minVol
+    ? `하루 ${state.minvol[cur].toLocaleString("ko-KR")} ${VOL[cur].unit} 이상: ${volOk} / ${all.length}종목 (최근 3개월 평균)`
+    : `최근 3개월 하루 평균 거래대금 기준. 버튼을 누르거나 금액을 직접 입력하세요.`;
+  const k = state.sort;
+  rows.sort((a, b) => {
+    const x = a[k], y = b[k];
+    if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1;
+    return (typeof x === "string" ? x.localeCompare(y, "ko") : x - y) * state.dir;
+  });
+
+  const counts = {}; all.forEach(r => counts[r.status || "없음"] = (counts[r.status || "없음"] || 0) + 1);
+  const flagged = all.filter(r => r.flags.length).length;
+  $("summary").innerHTML = [
+    `통과 <strong>${all.length}</strong>`,
+    `흑자·흑자전환 <strong>${(counts["흑자"] || 0) + (counts["흑자전환"] || 0)}</strong>`,
+    `적자전환·적자지속 <strong>${(counts["적자전환"] || 0) + (counts["적자지속"] || 0)}</strong>`,
+    ...(counts["없음"] ? [`순이익 비교 불가 <strong>${counts["없음"]}</strong>`] : []),
+    ...(cur === "USD" ? [`확인 필요 <strong>${flagged}</strong>`] : []),
+    `중앙값 비율 <strong>${median(all.map(r => r.ratio)).toFixed(2)}</strong>`,
+  ].map(s => `<span>${s}</span>`).join("");
+  $("asof").textContent = `${d.label}: ${d.asof}`;
+
+  const max = 2 / 3;
+  $("body").innerHTML = rows.length ? rows.map(r => `<tr>
+    <td class="rank">${r.rank}</td>
+    <td class="l name">${esc(r.name)}<span class="code">${esc(r.code)}</span></td>
+    <td><div class="ratio"><span class="num">${r.ratio?.toFixed(3) ?? "–"}</span><span class="bar" title="2/3 기준 대비"><i style="width:${Math.min(100, (r.ratio ?? 0) / max * 100)}%"></i></span></div></td>
+    <td>${price(r.price, cur)}</td>
+    <td>${price(r.ncavps, cur)}</td>
+    <td>${money(r.mcap, cur)}</td>
+    <td>${money(r.ncav, cur)}</td>
+    <td>${money(r.ni, cur)}</td>
+    <td>${volume(r.vol, cur)}</td>
+    <td class="l"><span class="pill p-${esc(r.status || "없음")}">${esc(r.status || "비교 불가")}</span></td>
+    <td class="l"><div class="flags">${r.flags.map(f => `<span class="flag">${esc(f)}</span>`).join("")}</div></td>
+  </tr>`).join("") : `<tr><td colspan="${cols.length}" class="empty">조건에 맞는 종목이 없습니다. 검색어나 필터를 바꿔 보세요.</td></tr>`;
+}
+function median(a) { const s = a.filter(x => x != null).sort((x, y) => x - y); return s.length ? s[Math.floor(s.length / 2)] : 0; }
+
+["q", "status", "noflag"].forEach(id => $(id).addEventListener("input", render));
+$("minvol").addEventListener("input", e => setMinVol(parseFloat(e.target.value)));
+renderTabs(); renderVol(); render();
+</script>
