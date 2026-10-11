@@ -1159,6 +1159,8 @@ def _manual_shares(latest: dict, market: dict, close: dict, as_of: date) -> dict
     for m in _load_csv(path):
         t, d = m["티커"], m["기준일"]
         r = latest.get(t)
+        if not m.get("발행주식수"):  # 전환우선주 환산만 적은 줄 (screen-edgar 출력 때 _manual_convertible이 씀)
+            continue
         if not r or t not in market or d > as_of.isoformat() or d <= (r.get("발행주식수_기준일") or ""):
             continue
         shares = float(m["발행주식수"])
@@ -1166,6 +1168,17 @@ def _manual_shares(latest: dict, market: dict, close: dict, as_of: date) -> dict
         r["발행주식수_기준일"] = d
         notes[t] = f"수동 {d}: {shares:,.0f}주×${close[t]:,.2f} ({m['출처']})"
     return notes
+
+
+def _manual_convertible(as_of: date) -> dict:
+    """manual_shares.csv의 전환우선주 보통주 환산 주식수. 반환: {티커: (기준일, 주식수, 출처)} (기준월 말 이전 중 최신)."""
+    path = DATA_DIR.parent / "manual_shares.csv"
+    out = {}
+    for m in (_load_csv(path) if path.exists() else []):
+        if m.get("전환우선주_보통주환산") and m["기준일"] <= as_of.isoformat():
+            if m["티커"] not in out or m["기준일"] > out[m["티커"]][0]:
+                out[m["티커"]] = (m["기준일"], float(m["전환우선주_보통주환산"]), m["출처"])
+    return out
 
 
 def _split_adjust(latest: dict, market: dict, prices: list[dict], month: str) -> dict:
@@ -1278,15 +1291,18 @@ def screen_edgar(args: list[str]) -> None:
         print(f"  {name}: {count}")
     factor = {(r["티커"], r["월"]): float(r["종가"]) / float(r["종가(분할반영)"])
               for r in prices if r["종가"] and r["종가(분할반영)"] and float(r["종가(분할반영)"]) > 0}
+    manual_conv = _manual_convertible(as_of)
     out = []
     for p in passed:
         r = latest[p["종목코드"]]
         t = p.pop("종목코드")
         # 전환우선주를 보통주로 바꾸면: 주식수 + 환산 주식수, 순유동자산에서 뺐던 우선주는 다시 더함 (참고용, 통과 조건은 그대로)
-        conv = _convertible_preferred(edgar, r["CIK"], r["종료일"])
+        conv, conv_date = _convertible_preferred(edgar, r["CIK"], r["종료일"]), r["종료일"]
+        if t in manual_conv and manual_conv[t][0] >= r["종료일"]:  # 공시 본문으로 확인한 더 최신 값
+            conv_date, conv = manual_conv[t][:2]
         diluted = ""
         if conv:
-            f_end, f_now = factor.get((t, r["종료일"][:7])), factor.get((t, month))
+            f_end, f_now = factor.get((t, conv_date[:7])), factor.get((t, month))
             conv_now = conv * (f_end / f_now) if f_end and f_now else conv  # 기간 말 이후 분할·병합 반영
             shares_now = market[t]["shares"]
             diluted = round((shares_now + conv_now) * close[t] / (p["순유동자산"] + (p.get("우선주") or 0)), 3)
