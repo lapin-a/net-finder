@@ -1061,6 +1061,24 @@ def _cover_classes(edgar: EdgarClient, cik: str, end: str) -> list[dict]:
     return classes
 
 
+def _convertible_preferred(edgar: EdgarClient, cik: str, end: str) -> float | None:
+    """보고기간 종료일이 end인 10-Q·10-K의 전환우선주 보통주 환산 주식수 (data/cache/edgar_xbrl/conv_<CIK>_<종료일>.json)."""
+    cache = DATA_DIR / "cache/edgar_xbrl" / f"conv_{int(cik)}_{end}.json"
+    if cache.exists():
+        return json.loads(cache.read_text(encoding="utf-8"))["shares"]
+    filings = [f for f in edgar.filings(cik, ("10-Q", "10-K", "10-Q/A", "10-K/A"), include_older=True) if f["reportDate"] == end]
+    filings.sort(key=lambda f: (f["form"].endswith("/A"), f["filingDate"]))
+    shares = None
+    for f in filings[:1]:
+        try:
+            shares = analysis.xbrl_convertible_preferred(edgar.filing_instance(cik, f["accessionNumber"]), end)
+        except (FileNotFoundError, SyntaxError):
+            pass
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"shares": shares}), encoding="utf-8")
+    return shares
+
+
 def _class_market_caps(edgar: EdgarClient, latest: dict, market: dict, close: dict, others: dict, month: str) -> dict:
     """그 분기 10-Q·10-K 표지 XBRL의 종류별 주식수로 시가총액을 다시 계산한다. 대상 (순유동자산이 양수인 회사만):
     - 주식 종류가 여럿인 회사(같은 CIK에 보통주 티커가 둘 이상): 종류별 주식수 × 종류별 종가.
@@ -1258,10 +1276,21 @@ def screen_edgar(args: list[str]) -> None:
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
     for name, count in stages.items():
         print(f"  {name}: {count}")
+    factor = {(r["티커"], r["월"]): float(r["종가"]) / float(r["종가(분할반영)"])
+              for r in prices if r["종가"] and r["종가(분할반영)"] and float(r["종가(분할반영)"]) > 0}
     out = []
     for p in passed:
         r = latest[p["종목코드"]]
         t = p.pop("종목코드")
+        # 전환우선주를 보통주로 바꾸면: 주식수 + 환산 주식수, 순유동자산에서 뺐던 우선주는 다시 더함 (참고용, 통과 조건은 그대로)
+        conv = _convertible_preferred(edgar, r["CIK"], r["종료일"])
+        diluted = ""
+        if conv:
+            f_end, f_now = factor.get((t, r["종료일"][:7])), factor.get((t, month))
+            conv_now = conv * (f_end / f_now) if f_end and f_now else conv  # 기간 말 이후 분할·병합 반영
+            shares_now = market[t]["shares"]
+            diluted = round((shares_now + conv_now) * close[t] / (p["순유동자산"] + (p.get("우선주") or 0)), 3)
+            conv = round(conv_now)
         out.append({"CIK": r["CIK"], "티커": t, "회사명": p.pop("회사명"),
                     "기간": r["기간"], "종료일": r["종료일"],
                     "재무경과일": (as_of - date.fromisoformat(r["종료일"])).days,  # 기준일 − 분기 종료일
@@ -1272,6 +1301,7 @@ def screen_edgar(args: list[str]) -> None:
                     "발행주식수_기준일": r.get("발행주식수_기준일", ""),
                     "분할보정": split_notes.get(t, ""),
                     "시가총액_계산": class_notes.get(t, ""),
+                    "전환우선주_보통주환산": conv or "", "전환후_시총÷순유동자산": diluted,
                     "같은 회사 다른 티커": " ".join(o for o in others.get(r["CIK"], []) if o != t)})
     save_csv(f"analysis/edgar/screen_{month}.csv", out, list(out[0]) if out else ["티커"])
 

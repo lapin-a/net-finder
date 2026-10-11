@@ -983,6 +983,36 @@ def xbrl_cover_classes(xml_bytes: bytes) -> list[dict]:
     return [{"member": m, "symbol": symbols.get(m), "shares": v, "date": d} for m, (d, v) in sorted(shares.items())]
 
 
+def xbrl_convertible_preferred(xml_bytes: bytes, period_end: str) -> float | None:
+    """10-Q·10-K XBRL에서 기간 말 전환우선주의 보통주 환산 주식수. 없으면 None.
+
+    주당순이익 계산에서 뺀 희석 증권(AntidilutiveSecuritiesExcludedFromComputationOfEarningsPerShareAmount)의
+    종류(member)에 'Preferred'가 들어간 값의 합. 적자 회사는 전환우선주를 희석 증권으로 여기에 적는다 (SMTK 4,544만 주).
+    """
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_bytes)
+    contexts = {}
+    for c in root.iter(f"{XBRLI}context"):
+        period = c.find(f"{XBRLI}period")
+        end = period.findtext(f"{XBRLI}endDate") or period.findtext(f"{XBRLI}instant")
+        members = [(m.text or "").strip().split(":")[-1] for m in c.iter(f"{XBRLDI}explicitMember")]
+        contexts[c.get("id")] = (end and end.strip(), members)
+    found = {}
+    for el in root:
+        if not isinstance(el.tag, str) or el.text is None:
+            continue
+        if el.tag.split("}")[-1] != "AntidilutiveSecuritiesExcludedFromComputationOfEarningsPerShareAmount":
+            continue
+        end, members = contexts.get(el.get("contextRef"), (None, []))
+        if end != period_end or len(members) != 1 or "Preferred" not in members[0]:
+            continue
+        try:
+            found[members[0]] = float(el.text.strip())
+        except ValueError:
+            pass
+    return sum(found.values()) if found else None
+
+
 def pick_buyback_shares(facts: list[dict], start: str, end: str):
     """한 기간의 자사주매입 주식수 하나를 고른다. 반환: (값, 출처 설명) 또는 (None, None)
 
