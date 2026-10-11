@@ -23,6 +23,8 @@ from main import us_kinds  # noqa: E402
 load_dotenv(ROOT / ".env")
 A = ROOT / "data/analysis"
 MONTHS = 3  # 거래대금 평균 기간
+NOTES = {r["티커"]: r["메모"] for r in csv.DictReader(open(ROOT / "manual_notes.csv", encoding="utf-8-sig"))} \
+    if (ROOT / "manual_notes.csv").exists() else {}  # 공시 본문으로 확인한 종목 메모 (확인 필요 칸에 표시)
 
 
 def load(p):
@@ -122,6 +124,8 @@ def us(rows, volume):
                 flags.append("ADS 비율 미확인")
             if (r.get("발행주식수_출처") or "").startswith("가중평균"):
                 flags.append("주식수 가중평균 (단위 확인)")
+        if r["티커"] in NOTES:  # manual_notes.csv: 공시 본문으로 확인한 내용
+            flags.append(NOTES[r["티커"]])
         if r.get("단위_의심"):
             flags.append(f"단위 오류 의심 ({r['단위_의심']})")
         ratio = num(r["시총÷순유동자산"])
