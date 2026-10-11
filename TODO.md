@@ -101,7 +101,7 @@
   - 점검 끝나고 다시 실행 (2026-10-11 오후): 상장사 목록 3,099 → 3,998곳으로 갱신. 2025년 3분기, 2024·2023년 전체, 2022년 1분기 받음.
     2022년 2분기 613/2294에서 일일 한도(DART 오류 020)로 중단 → **다음 날 2022년 2분기부터 이어서**
   - 자동 실행: 윈도우 작업 스케줄러 `net-finder-dart-quarterly`가 매일 9시 `data/dart_quarterly_daily.cmd` 실행
-    (수집 → `adjust-splits` → 한도·오류 없이 끝나면 예약 작업을 스스로 삭제). 로그 `data/logs/dart_quarterly.log
+    (수집 → `adjust-splits` → 한도·오류 없이 끝나면 예약 작업을 스스로 삭제). 로그 `data/logs/dart_quarterly.log`
   - 출력을 파일로 보낼 때는 `PYTHONIOENCODING=utf-8` 필요 (Windows 기본 cp932로 한글 출력에서 오류)
 - [x] EDGAR 분기 자사주매입 주식수 빈칸 (2026-10-11): 주가가 없는 분기(2016년 이전 등)는 같은 회계연도 연간 실제 평균 매입가로 추정
   - `estimate-edgar-buyback` 분기에 추가 (출처 `주가 추정(연간 평균 매입가): $x`). 5,243칸
