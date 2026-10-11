@@ -122,6 +122,8 @@ def us(rows, volume):
                 flags.append("ADS 비율 미확인")
             if (r.get("발행주식수_출처") or "").startswith("가중평균"):
                 flags.append("주식수 가중평균 (단위 확인)")
+        if r.get("단위_의심"):
+            flags.append(f"단위 오류 의심 ({r['단위_의심']})")
         ratio = num(r["시총÷순유동자산"])
         if ratio is not None and ratio < 0.01:
             flags.append("비율 0.01 미만: 주식수·단위 확인")

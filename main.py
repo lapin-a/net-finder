@@ -1587,13 +1587,27 @@ def screen_edgar(args: list[str]) -> None:
     # 해외 기업(20-F·40-F): 연간만 내는 회사가 많아 종료일 기준 FOREIGN_MAX_AGE일까지, 기준일 전에 제출된 기간만
     foreign = set()
     foreign_path = edgar_dir / "해외_분기.csv"
+    current_assets = {}  # 해외 티커 → [(종료일, 유동자산)] (단위 오류 의심 확인용)
     for r in (_load_csv(foreign_path) if foreign_path.exists() and "--no-foreign" not in args else []):
         end = date.fromisoformat(r["종료일"])
+        if r["유동자산"]:
+            current_assets.setdefault(r["티커"], []).append((r["종료일"], float(r["유동자산"])))
         if (as_of - timedelta(days=FOREIGN_MAX_AGE) <= end and r["제출일"] <= as_of.isoformat() and r["주당순유동자산"]
                 and (r["티커"] not in latest or r["티커"] in foreign) and not NON_COMMON_TICKER.search(r["티커"])):
             if r["티커"] not in foreign or r["종료일"] > latest[r["티커"]]["종료일"]:
                 latest[r["티커"]] = r
                 foreign.add(r["티커"])
+    # 유동자산이 이전 기간들의 중앙값보다 300배 넘게 크거나 작으면 회사가 XBRL 단위를 잘못 적었을 가능성
+    # (UPC: 2024년 9월부터 1,000배. 직전 기간도 틀려 있어서 중앙값과 비교)
+    unit_doubt = {}
+    for t in foreign:
+        cur = latest[t]["종료일"]
+        prev = [v for e, v in current_assets.get(t, []) if e < cur and v > 0]
+        now = next((v for e, v in current_assets.get(t, []) if e == cur), None)
+        if prev and now:
+            gap = now / statistics.median(prev)
+            if not 1 / 300 <= gap <= 300:
+                unit_doubt[t] = f"유동자산이 이전 기간 중앙값의 {gap:,.0f}배"
 
     annual_by = {}
     for r in _load_csv(edgar_dir / "연간.csv"):
@@ -1670,7 +1684,8 @@ def screen_edgar(args: list[str]) -> None:
                     "전환우선주_보통주환산": conv or "", "전환후_시총÷순유동자산": diluted,
                     "같은 회사 다른 티커": " ".join(o for o in others.get(r["CIK"], []) if o != t),
                     "해외": f"{r['통화']} {r['회계기준']} 제출 {r['제출일']}" if t in foreign else "",
-                    "ADS비율": ads[t]["ratio"] if t in ads else "", "ADS_문구": ads.get(t, {}).get("note", "")})
+                    "ADS비율": ads[t]["ratio"] if t in ads else "", "ADS_문구": ads.get(t, {}).get("note", ""),
+                    "단위_의심": unit_doubt.get(t, "")})
     save_csv(f"analysis/edgar/screen_{month}.csv", out, list(out[0]) if out else ["티커"])
 
 
