@@ -75,6 +75,14 @@ tbody tr:hover { background: var(--accent-soft); }
 .vol .unit { color: var(--muted); }
 .vol .hint { color: var(--muted); font-size: 0.82rem; flex-basis: 100%; }
 .novol { color: var(--muted); font-size: 0.8rem; }
+.kinds { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; margin: 0; padding: 8px 12px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.kinds legend { padding: 0 4px; color: var(--fg); font-weight: 500; }
+.kinds label { display: flex; gap: 6px; align-items: center; color: var(--muted); cursor: pointer; }
+.kinds b { font-family: var(--mono); font-weight: 500; color: var(--fg); }
+.kinds input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.kind { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 4px; font-size: 0.72rem;
+  background: var(--accent-soft); color: var(--accent); vertical-align: 1px; }
 footer { color: var(--muted); font-size: 0.85rem; display: grid; gap: 4px; max-width: 80ch; }
 @media (max-width: 600px) { h1 { font-size: 1.3rem; } .controls input[type=search] { width: 100%; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
@@ -104,6 +112,14 @@ footer { color: var(--muted); font-size: 0.85rem; display: grid; gap: 4px; max-w
     </label>
     <label for="noflag"><input type="checkbox" id="noflag"> 확인 필요 표시 없는 종목만</label>
   </div>
+
+  <fieldset class="kinds" id="kinds">
+    <legend>종류</legend>
+    <label for="k-company"><input type="checkbox" id="k-company" data-kind="" checked> 일반 기업 <b id="n-company"></b></label>
+    <label for="k-spac"><input type="checkbox" id="k-spac" data-kind="SPAC" checked> SPAC <b id="n-spac"></b></label>
+    <label for="k-etf"><input type="checkbox" id="k-etf" data-kind="ETF" checked> ETF <b id="n-etf"></b></label>
+    <label for="k-fund"><input type="checkbox" id="k-fund" data-kind="펀드" checked> 펀드·신탁·리츠 <b id="n-fund"></b></label>
+  </fieldset>
 
   <div class="vol" role="group" aria-labelledby="vol-label">
     <span class="vol-label" id="vol-label">하루 거래대금 최소</span>
@@ -218,8 +234,11 @@ function render() {
   const all = d.rows.map((r, i) => ({ ...r, rank: i + 1 }));
   const minVol = (state.minvol[cur] || 0) * VOL[cur].scale;
   const volOk = all.filter(r => (r.vol || 0) >= minVol).length;
+  const shown = new Set([...document.querySelectorAll("#kinds input:checked")].map(i => i.dataset.kind));
+  const kindCount = k => all.filter(r => (r.kind || "") === k).length;
+  [["company", ""], ["spac", "SPAC"], ["etf", "ETF"], ["fund", "펀드"]].forEach(([id, k]) => $(`n-${id}`).textContent = kindCount(k));
   let rows = all.filter(r => (!q || r.name.toLowerCase().includes(q) || r.code.toLowerCase().includes(q))
-    && (!st || r.status === st) && (!noflag || !r.flags.length) && (r.vol || 0) >= minVol);
+    && (!st || r.status === st) && (!noflag || !r.flags.length) && (r.vol || 0) >= minVol && shown.has(r.kind || ""));
   $("vol-hint").textContent = minVol
     ? `하루 ${state.minvol[cur].toLocaleString("ko-KR")} ${VOL[cur].unit} 이상: ${volOk} / ${all.length}종목 (최근 3개월 평균)`
     : `최근 3개월 하루 평균 거래대금 기준. 버튼을 누르거나 금액을 직접 입력하세요.`;
@@ -245,7 +264,7 @@ function render() {
   const max = 2 / 3;
   $("body").innerHTML = rows.length ? rows.map(r => `<tr>
     <td class="rank">${r.rank}</td>
-    <td class="l name">${esc(r.name)}<span class="code">${esc(r.code)}</span></td>
+    <td class="l name">${esc(r.name)}<span class="code">${esc(r.code)}</span>${r.kind ? `<span class="kind">${esc(r.kind)}</span>` : ""}</td>
     <td><div class="ratio"><span class="num">${r.ratio?.toFixed(3) ?? "–"}</span><span class="bar" title="2/3 기준 대비"><i style="width:${Math.min(100, (r.ratio ?? 0) / max * 100)}%"></i></span></div></td>
     <td>${price(r.price, cur)}</td>
     <td>${price(r.ncavps, cur)}</td>
@@ -261,5 +280,12 @@ function median(a) { const s = a.filter(x => x != null).sort((x, y) => x - y); r
 
 ["q", "status", "noflag"].forEach(id => $(id).addEventListener("input", render));
 $("minvol").addEventListener("input", e => setMinVol(parseFloat(e.target.value)));
+document.querySelectorAll("#kinds input").forEach(i => {
+  try { const saved = JSON.parse(localStorage.getItem("nn-kinds")); if (saved && i.dataset.kind in saved) i.checked = saved[i.dataset.kind]; } catch (e) {}
+  i.addEventListener("change", () => {
+    try { localStorage.setItem("nn-kinds", JSON.stringify(Object.fromEntries([...document.querySelectorAll("#kinds input")].map(x => [x.dataset.kind, x.checked])))); } catch (e) {}
+    render();
+  });
+});
 renderTabs(); renderVol(); render();
 </script>

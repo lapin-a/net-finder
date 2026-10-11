@@ -8,6 +8,7 @@
 import csv
 import json
 import os
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -16,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 
-from collectors import KrxClient  # noqa: E402
+from collectors import EdgarClient, KrxClient  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 A = ROOT / "data/analysis"
@@ -33,6 +34,37 @@ def num(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# 종류: SPAC / ETF / 펀드 (투자회사·신탁·리츠·인프라·선박투자). 나머지는 일반 기업("")
+US_SIC_KIND = {"6770": "SPAC", "6221": "ETF", "6722": "펀드", "6726": "펀드", "6798": "펀드"}
+KR_NAME_KIND = [(re.compile(r"스팩|기업인수목적"), "SPAC"), (re.compile(r"ETF|ETN"), "ETF"),
+                (re.compile(r"리츠|인프라|선박투자|펀드|투자회사"), "펀드")]
+US_NAME_KIND = [(re.compile(r"\bAcquisition (Corp|Co|Company|Holdings)\b|\bSPAC\b", re.I), "SPAC"),
+                (re.compile(r"\bETF\b|\bETN\b", re.I), "ETF"),
+                (re.compile(r"\b(Fund|Trust)\b", re.I), "펀드")]
+
+
+def kr_kind(name: str) -> str:
+    return next((k for pat, k in KR_NAME_KIND if pat.search(name)), "")
+
+
+def us_kinds(rows) -> dict:
+    """CIK → 종류. SEC 업종 코드(SIC, data/cache/edgar_sic.json에 저장) 우선, 없으면 이름."""
+    cache_path = ROOT / "data/cache/edgar_sic.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    edgar = None
+    out = {}
+    for r in rows:
+        cik = r["CIK"]
+        if cik not in cache:
+            edgar = edgar or EdgarClient(os.getenv("EDGAR_USER_AGENT", ""))
+            sub = edgar.submissions(cik)
+            cache[cik] = [sub.get("sic") or "", sub.get("sicDescription") or ""]
+        out[cik] = US_SIC_KIND.get(cache[cik][0]) or next((k for pat, k in US_NAME_KIND if pat.search(r["회사명"])), "")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    return out
 
 
 def kr_volume(price_date: str) -> dict:
@@ -69,11 +101,12 @@ def kr(rows, volume):
         "ratio": num(r["시총÷순유동자산"]), "price": num(r["종가"]),
         "ncavps": num(r["주당순유동자산"]), "mcap": num(r["시가총액"]), "ncav": num(r["순유동자산"]),
         "ni": num(r["순이익"]), "status": r.get("순이익상태_3년", ""), "flags": [],
-        "vol": round(volume.get(r["종목코드"], 0)),
+        "vol": round(volume.get(r["종목코드"], 0)), "kind": kr_kind(r["회사명"]),
     } for r in rows]
 
 
 def us(rows, volume):
+    kinds = us_kinds(rows)
     out = []
     for r in rows:
         flags = []
@@ -105,7 +138,7 @@ def us(rows, volume):
             "ratio": num(r["시총÷순유동자산"]), "price": num(r["종가"]),
             "ncavps": num(r["주당순유동자산"]), "mcap": mcap, "ncav": num(r["순유동자산"]),
             "ni": num(r["순이익"]), "status": r.get("순이익상태_3년", ""), "flags": flags,
-            "vol": round(volume.get(r["티커"], 0)),
+            "vol": round(volume.get(r["티커"], 0)), "kind": kinds.get(r["CIK"], ""),
         })
     return out
 
