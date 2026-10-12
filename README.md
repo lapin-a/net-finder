@@ -193,6 +193,17 @@ python report/build_page.py   # → data/analysis/netnet_candidates.html
 검색·순이익 상태·확인 필요 표시·최소 거래대금(버튼 또는 직접 입력)으로 거를 수 있습니다.
 거래대금은 주가 기준일까지 최근 3개월 하루 평균 (한국 KRX 일별 거래대금, 미국 Alpaca 월봉 VWAP × 거래량 ÷ 거래일).
 
+### 결과 확인 (회귀 검사)
+
+```bash
+python checks.py   # API 호출 없음. 실패가 있으면 종료 코드 1
+```
+
+규칙을 고쳐 다시 계산한 뒤 돌립니다. 스크리너 결과의 순유동자산·비율을 열 값으로 다시 계산하고, 공시 본문으로 확인한 종목
+(CREG·CTNT·MI 수동 주식수, SMTK 전환 후 비율, FTFT·LHSW·WCT·EHTH·FBIO 탈락, UPC 단위 의심, TC ADS 비율),
+분할 배율(AAPL·NVDA·삼성전자), 우선주·총부채 출처, 한국 네 분기 순이익 합 ≈ 연간, 목록 페이지 종목 수, `manual_notes.csv` 형식을 확인합니다.
+새로 본문 확인한 종목이 생기면 `checks.py`에 한 줄 추가합니다.
+
 ### 원본 데이터
 
 ```bash

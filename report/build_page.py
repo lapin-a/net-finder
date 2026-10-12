@@ -104,6 +104,8 @@ def kr_flags(r, history: dict, period: str, back: list[str]) -> list[str]:
         if med <= 0 or not 1 / NCAV_JUMP <= cur / med <= NCAV_JUMP:
             flags.append(f"순유동자산 급변: 직전 {len(back)}{'분기' if 'Q' in period else '년'} 중앙값 "
                          f"{med / 1e8:,.0f}억 → {cur / 1e8:,.0f}억 원")
+    if r["종목코드"] in NOTES:  # manual_notes.csv (한국은 종목코드)
+        flags.append(NOTES[r["종목코드"]])
     return flags
 
 
