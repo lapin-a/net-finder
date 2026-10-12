@@ -140,7 +140,8 @@ python main.py screen-dart --quarterly       # 최신 분기
 - 분기 기준의 순이익 상태는 최근 4분기 합으로 계산합니다.
 - 연도·분기를 생략하면 자료가 충분한(가장 많은 기간의 절반 이상) 최신 기간을 씁니다. 결산월이 12월이 아닌 회사 몇십 곳만 있는 기간은 건너뜁니다.
 
-→ `data/analysis/dart/screen_<연도|분기>_<주가기준일>.csv` (시총÷순유동자산이 낮은 순). 조건만 바꿔 다시 실행하면 같은 파일을 덮어씁니다.
+→ `data/analysis/dart/screen_<연도|분기>_<주가기준일><조건>.csv` (시총÷순유동자산이 낮은 순). 기본 조건이 아니면 파일 이름 끝에 옵션이 붙습니다
+(예: `--no-profit --no-buyback` → `_no-buyback_no-profit`). 조건을 바꿔 다시 실행해도 다른 조건의 결과를 덮어쓰지 않습니다.
 
 ### 넷넷 스크리너 (미국)
 
@@ -177,15 +178,19 @@ python main.py screen-edgar --lag 60 --ratio 1
 - 비율·순이익 조건과 옵션(`--ratio`, `--profit`, `--profit-years`, `--no-profit`, `--no-buyback`)은 한국과 같습니다.
 - 워런트·유닛·권리 티커(나스닥 5글자 W·U·R, `-WT`·`-U` 등)는 뺍니다.
 
-→ `data/analysis/edgar/screen_<기준월>.csv` (시총÷순유동자산이 낮은 순)
+→ `data/analysis/edgar/screen_<기준월><조건>.csv` (시총÷순유동자산이 낮은 순, 조건 표시는 한국과 같음)
 
 ### 목록 페이지
 
 ```bash
-python report/build_page.py   # 스크리너 결과 → data/analysis/netnet_candidates.html
+python main.py screen-edgar <최신 월> --no-profit --no-buyback   # 미국은 먼저 (한국은 페이지 생성 때 같이 계산)
+python report/build_page.py   # → data/analysis/netnet_candidates.html
 ```
 
-한국 2026Q2·2025, 미국 2026-09 결과를 탭으로 보여 주고, 검색·순이익 상태·확인 필요 표시·최소 거래대금(버튼 또는 직접 입력)으로 거를 수 있습니다.
+비율 조건만(`--no-profit --no-buyback`) 쓴 결과를 탭으로 보여 줍니다. 한국은 최신 분기·최신 연도 재무에 최근 거래일(어제 이전) 주가로
+`screen-dart`를 다시 돌리고, 미국은 주가 파일의 최신 월 `screen-edgar` 결과를 읽습니다.
+한국 확인 필요 표시: 지주회사(비지배지분을 아직 안 뺌), 순유동자산이 직전 4분기(연간은 3년) 중앙값의 2배 넘게 또는 절반 미만으로 바뀐 종목.
+검색·순이익 상태·확인 필요 표시·최소 거래대금(버튼 또는 직접 입력)으로 거를 수 있습니다.
 거래대금은 주가 기준일까지 최근 3개월 하루 평균 (한국 KRX 일별 거래대금, 미국 Alpaca 월봉 VWAP × 거래량 ÷ 거래일).
 
 ### 원본 데이터

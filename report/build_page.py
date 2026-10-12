@@ -2,13 +2,16 @@
 
     python report/build_page.py
 
-한국 2026Q2·2025, 미국 2026-09 결과를 읽어 report/template.html에 넣는다.
+한국: 최신 분기·최신 연도 재무에 최근 거래일(어제 이전) 주가로 screen-dart를 비율 조건만으로 돌린다 (DART 호출 없음, KRX 캐시).
+미국: 주가 파일의 최신 월 screen-edgar 결과(--no-profit --no-buyback 파일)를 읽는다. 없으면 먼저 그 명령을 실행하라고 알린다.
+결과를 report/template.html에 넣는다.
 거래대금: 주가 기준일까지 최근 3개월 하루 평균 (한국 KRX 일별 거래대금, 미국 Alpaca 월봉 VWAP × 거래량 ÷ 거래일).
 """
 import csv
 import json
 import os
 import re
+import statistics
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -18,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 
 from collectors import KrxClient  # noqa: E402
-from main import us_kinds  # noqa: E402
+from main import screen_dart, screen_tag, us_kinds  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 A = ROOT / "data/analysis"
@@ -76,12 +79,45 @@ def us_volume(month: str) -> dict:
     return {t: v / (MONTHS * 21) for t, v in total.items()}
 
 
-def kr(rows, volume):
+HOLDING = re.compile(r"홀딩스|지주")
+NCAV_JUMP = 2  # 순유동자산이 직전 기간 중앙값의 이 배수 넘게(또는 1/배수 미만) 바뀌면 표시
+
+
+def kr_history(kind: str) -> dict:
+    """종목코드 → {기간: 순유동자산}. kind: 분기(기간 '2026Q2') / 연간(연도)."""
+    out = {}
+    for r in load(A / f"dart/batch_상장사_{kind}.csv"):
+        ca, tl = num(r["유동자산"]), num(r["총부채"])
+        if ca is not None and tl is not None:
+            out.setdefault(r["종목코드"], {})[r["기간" if kind == "분기" else "연도"]] = ca - tl
+    return out
+
+
+def kr_flags(r, history: dict, period: str, back: list[str]) -> list[str]:
+    flags = []
+    if HOLDING.search(r["회사명"]):  # 연결 순유동자산에 상장 자회사 외부 주주 몫이 섞임 (한국은 비지배지분을 안 뺌)
+        flags.append("지주회사: 비지배지분 안 뺌 (순유동자산 과대 가능)")
+    prev = [v for p, v in history.get(r["종목코드"], {}).items() if p in back]
+    cur = num(r["순유동자산"])
+    if len(prev) >= 2 and cur:
+        med = statistics.median(prev)
+        if med <= 0 or not 1 / NCAV_JUMP <= cur / med <= NCAV_JUMP:
+            flags.append(f"순유동자산 급변: 직전 {len(back)}{'분기' if 'Q' in period else '년'} 중앙값 "
+                         f"{med / 1e8:,.0f}억 → {cur / 1e8:,.0f}억 원")
+    return flags
+
+
+def kr(rows, volume, history, period):
+    if "Q" in period:  # 직전 4분기
+        y, q = int(period[:4]), int(period[-1])
+        back = [f"{(y * 4 + q - 1 - k) // 4}Q{(y * 4 + q - 1 - k) % 4 + 1}" for k in range(1, 5)]
+    else:  # 직전 3년
+        back = [str(int(period) - k) for k in range(1, 4)]
     return [{
         "code": r["종목코드"], "name": r["회사명"],
         "ratio": num(r["시총÷순유동자산"]), "price": num(r["종가"]),
         "ncavps": num(r["주당순유동자산"]), "mcap": num(r["시가총액"]), "ncav": num(r["순유동자산"]),
-        "ni": num(r["순이익"]), "status": r.get("순이익상태_3년", ""), "flags": [],
+        "ni": num(r["순이익"]), "status": r.get("순이익상태_3년", ""), "flags": kr_flags(r, history, period, back),
         "vol": round(volume.get(r["종목코드"], 0)), "kind": kr_kind(r["회사명"]),
     } for r in rows]
 
@@ -145,15 +181,25 @@ def fmt_day(s):
     return f"{s[:4]}-{s[4:6]}-{s[6:]}"
 
 
-kr_q, kr_y = "20260630", "20251230"
-us_month = "2026-09"
+RATIO_ONLY = ["--no-profit", "--no-buyback"]  # 목록 페이지는 비율 조건만
+krx = KrxClient(os.getenv("KRX_API_KEY", ""), cache_dir=ROOT / "data/cache/krx")
+price_day, _ = krx.last_trading_day(date.today() - timedelta(days=1))  # 오늘 자료는 장 마감 뒤에야 나옴
+kr_q_path = screen_dart(["--quarterly", *RATIO_ONLY, "--price-date", price_day])
+kr_y_path = screen_dart([*RATIO_ONLY, "--price-date", price_day])
+kr_q, kr_y = kr_q_path.stem.split("_")[1], kr_y_path.stem.split("_")[1]  # screen_<기간>_<기준일>_<조건>
+us_month = max(r["월"] for r in load(A / "edgar/주가_월별.csv"))
+us_path = A / f"edgar/screen_{us_month}{screen_tag(RATIO_ONLY)}.csv"
+if not us_path.exists():
+    sys.exit(f"{us_path} 가 없습니다 → 먼저 python main.py screen-edgar {us_month} {' '.join(RATIO_ONLY)}")
+kr_volume_now = kr_volume(price_day)
 data = {
-    "krq": {"label": "한국 2026년 2분기", "cur": "KRW", "asof": f"재무 2026Q2 · 주가 {fmt_day(kr_q)}",
-            "niLabel": "순이익(최근 4분기)", "rows": kr(load(A / f"dart/screen_2026Q2_{kr_q}.csv"), kr_volume(kr_q))},
-    "kry": {"label": "한국 2025년 연간", "cur": "KRW", "asof": f"재무 2025년 · 주가 {fmt_day(kr_y)}",
-            "niLabel": "순이익(2025)", "rows": kr(load(A / f"dart/screen_2025_{kr_y}.csv"), kr_volume(kr_y))},
-    "us": {"label": "미국 2026년 9월", "cur": "USD", "asof": f"주가 {us_month} 말 · 회사별 최신 분기 재무 (해외 기업은 최신 20-F·40-F·6-K)",
-           "niLabel": "순이익(최근 4분기)", "rows": us(load(A / f"edgar/screen_{us_month}.csv"), us_volume(us_month))},
+    "krq": {"label": f"한국 {kr_q[:4]}년 {kr_q[-1]}분기", "cur": "KRW", "asof": f"재무 {kr_q} · 주가 {fmt_day(price_day)}",
+            "niLabel": "순이익(최근 4분기)", "rows": kr(load(kr_q_path), kr_volume_now, kr_history("분기"), kr_q)},
+    "kry": {"label": f"한국 {kr_y}년 연간", "cur": "KRW", "asof": f"재무 {kr_y}년 · 주가 {fmt_day(price_day)}",
+            "niLabel": f"순이익({kr_y})", "rows": kr(load(kr_y_path), kr_volume_now, kr_history("연간"), kr_y)},
+    "us": {"label": f"미국 {us_month[:4]}년 {int(us_month[5:])}월", "cur": "USD",
+           "asof": f"주가 {us_month} 말 · 회사별 최신 분기 재무 (해외 기업은 최신 20-F·40-F·6-K)",
+           "niLabel": "순이익(최근 4분기)", "rows": us(load(us_path), us_volume(us_month))},
 }
 tpl = (ROOT / "report/template.html").read_text(encoding="utf-8")
 out = A / "netnet_candidates.html"

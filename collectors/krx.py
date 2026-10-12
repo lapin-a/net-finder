@@ -42,7 +42,9 @@ class KrxClient:
         time.sleep(self.delay)
         rows = resp.json().get("OutBlock_1", [])
 
-        if cache:
+        # 빈 응답은 휴장일이거나 아직 그날 자료가 안 나온 것 → 최근 며칠은 저장하지 않음 (오늘을 휴장일로 굳히지 않게)
+        recent = date.today() - date(int(bas_dd[:4]), int(bas_dd[4:6]), int(bas_dd[6:])) <= timedelta(days=3)
+        if cache and (rows or not recent):
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
         return rows

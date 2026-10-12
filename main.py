@@ -26,7 +26,7 @@
     python main.py fill-edgar-ends               # 글자별 결과에 보고기간 종료일 열 추가 (값은 그대로)
     python main.py fill-edgar-balance            # 글자별 결과의 발행주식수·우선주·비지배지분·주당순유동자산만 다시 계산 (나머지 열은 그대로)
     python main.py analyze-foreign-batch         # 해외 기업(20-F·40-F) → edgar/해외_분기.csv, 해외_연간.csv (달러 환산)
-    python main.py foreign-share-check 2026-09   # 해외 결과 중 확인 필요 종목의 표지 뒤 공시에서 발행주식수 문장 찾기 (검토용)
+    python main.py foreign-share-check 2026-09 --no-profit --no-buyback   # 해외 결과(같은 조건의 screen-edgar 파일) 중 확인 필요 종목의 표지 뒤 공시에서 발행주식수 문장 찾기 (검토용)
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
     python main.py us-prices                     # 미국 월별 주가 (Alpaca, 2016년부터) → edgar/주가_월별.csv
 
@@ -1192,7 +1192,24 @@ def screen_dart(args: list[str]) -> None:
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
     for name, count in stages.items():
         print(f"  {name}: {count}")
-    save_csv(f"analysis/dart/screen_{period}_{bas_dd}.csv", passed, list(passed[0]) if passed else ["종목코드"])
+    name = f"analysis/dart/screen_{period}_{bas_dd}{screen_tag(args)}.csv"
+    save_csv(name, passed, list(passed[0]) if passed else ["종목코드"])
+    return DATA_DIR / name
+
+
+# 값 없이 쓰는 옵션. 나머지 --옵션은 다음 인자가 값
+FLAG_OPTIONS = {"--no-profit", "--no-buyback", "--no-foreign", "--quarterly"}
+
+
+def screen_tag(args: list[str]) -> str:
+    """스크리너 결과 파일 이름에 붙일 조건 (기본 조건이면 빈 문자열). 예: --no-profit --no-buyback → '_no-buyback_no-profit'.
+    조건만 바꿔 다시 실행해도 다른 조건의 결과 파일을 덮어쓰지 않게 한다. 기간·기준일을 정하는 옵션(--quarterly, --price-date)은 뺀다."""
+    parts = []
+    for i, a in enumerate(args):
+        if not a.startswith("--") or a in ("--quarterly", "--price-date"):
+            continue
+        parts.append(a[2:] if a in FLAG_OPTIONS else f"{a[2:]}{args[i + 1]}")
+    return "".join(f"_{p}" for p in sorted(parts))
 
 
 # 보통주가 아닌 티커: 나스닥 5글자 W(워런트)·U(유닛)·R(권리), NYSE -WT·-U 등. 가격이 보통주와 달라 시가총액이 틀어진다
@@ -1477,7 +1494,7 @@ TWO_CLASS_STATEMENT = re.compile(  # 'X Class A ordinary shares and Y Class B or
 SHARE_FORMS = ("6-K", "6-K/A", "424B1", "424B3", "424B4", "424B5", "F-1", "F-1/A", "F-3", "F-3/A", "20-F", "20-F/A")
 
 
-def foreign_share_check(month: str, workers: int = 6) -> None:
+def foreign_share_check(month: str, tag: str = "", workers: int = 6) -> None:
     """screen-edgar 결과의 해외 기업 중 확인 필요 종목(표지 뒤 병합, 비율 0.01 미만, 재무 270일 초과, 가중평균 주식수)에 대해
     표지 날짜 뒤 공시(6-K·424B·F-1·F-3·20-F) 본문에서 '...ordinary shares ... outstanding' 문장과 그 근처 'as of 날짜'를 모은다.
     결과: analysis/edgar/해외_주식수_후보_<월>.csv (티커, 공시, 제출일, 기준일, 주식수, 종류, 문장). 사람이 보고 manual_shares.csv에 옮긴다.
@@ -1485,7 +1502,7 @@ def foreign_share_check(month: str, workers: int = 6) -> None:
     import html as html_lib
     from datetime import datetime
     edgar = EdgarClient(os.getenv("EDGAR_USER_AGENT", ""))
-    rows = [r for r in _load_csv(DATA_DIR / f"analysis/edgar/screen_{month}.csv") if r.get("해외")]
+    rows = [r for r in _load_csv(DATA_DIR / f"analysis/edgar/screen_{month}{tag}.csv") if r.get("해외")]
     year, mon = int(month[:4]), int(month[5:7])
     as_of = (date(year + mon // 12, mon % 12 + 1, 1) - timedelta(days=1)).isoformat()
 
@@ -1705,7 +1722,7 @@ def screen_edgar(args: list[str]) -> None:
                     "해외": f"{r['통화']} {r['회계기준']} 제출 {r['제출일']}" if t in foreign else "",
                     "ADS비율": ads[t]["ratio"] if t in ads else "", "ADS_문구": ads.get(t, {}).get("note", ""),
                     "단위_의심": unit_doubt.get(t, "")})
-    save_csv(f"analysis/edgar/screen_{month}.csv", out, list(out[0]) if out else ["티커"])
+    save_csv(f"analysis/edgar/screen_{month}{screen_tag(args)}.csv", out, list(out[0]) if out else ["티커"])
 
 
 QUARTER_ENDS ={1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
@@ -1931,7 +1948,7 @@ def main(argv: list[str]) -> None:
                            years_after("--buyback"), years_after("--buyback-quarterly"))
 
     elif cmd == "foreign-share-check":
-        foreign_share_check(args[0])
+        foreign_share_check(args[0], screen_tag(args[1:]))
 
     elif cmd == "analyze-foreign-batch":
         analyze_foreign_batch(EdgarClient(os.getenv("EDGAR_USER_AGENT", "")))
