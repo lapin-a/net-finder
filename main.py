@@ -34,6 +34,7 @@
     python main.py screen-dart                   # 최신 연도, 기본 조건
     python main.py screen-dart 2024 --ratio 1 --profit 흑자 --profit-years 5 --no-buyback
     python main.py screen-dart 2025 --price-date 20261007   # 연말 대신 해당일(직전 거래일) 주가로 비교
+    python main.py screen-dart 2026Q2 --minority  # 비지배지분을 순유동자산에서 빼고 거름 (통과 종목만 DART 호출)
     python main.py screen-edgar                  # 미국: 최신 월말 주가 + 회사별로 그때 공시됐을 최신 분기
     python main.py screen-edgar 2024-12 --no-buyback
 """
@@ -1147,6 +1148,8 @@ def screen_dart(args: list[str]) -> None:
     --no-buyback         자사주매입 주식수 전년 대비 증가 조건 끄기
                          (분기 기준일 때는 그 분기 이전 최신 연간 자사주매입으로 판단)
     --price-date YYYYMMDD  주가 기준일 (기본: 해당 연도·분기 말일, 휴장이면 직전 거래일)
+    --minority           비지배지분(연결 자본)을 순유동자산에서 빼고 비율 조건을 다시 봄 (미국과 같은 방식).
+                         통과 종목만 DART 회사별 호출(그 기간 연결 재무제표 1건씩, 캐시). 못 받은 종목은 남겨 둠
     """
     def opt(name, default):
         return args[args.index(name) + 1] if name in args else default
@@ -1190,6 +1193,21 @@ def screen_dart(args: list[str]) -> None:
 
     passed, stages = analysis.screen_net_net(rows, period, market, max_ratio, profit_years, profit_status,
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
+    if "--minority" in args:  # 비지배지분을 순유동자산에서 빼고 비율 조건을 다시 봄 (통과 종목만 DART 회사별 호출, 캐시)
+        minority = kr_minority([p["종목코드"] for p in passed], period)
+        kept = []
+        for p in passed:
+            n = minority[p["종목코드"]]
+            adj = p["순유동자산"] - (n or 0)
+            p["비지배지분"] = n
+            p["시총÷(순유동자산−비지배지분)"] = round(p["시가총액"] / adj, 3) if adj > 0 else None
+            if n is None or (adj > 0 and p["시가총액"] / adj <= max_ratio):  # 못 받은 종목(n=None)은 남겨 둠
+                kept.append(p)
+        stages["비지배지분 차감 후"] = len(kept)
+        unknown = sum(minority[p["종목코드"]] is None for p in kept)
+        if unknown:
+            stages["  (비지배지분 미확인, 남겨 둠)"] = unknown
+        passed = kept
     for name, count in stages.items():
         print(f"  {name}: {count}")
     name = f"analysis/dart/screen_{period}_{bas_dd}{screen_tag(args)}.csv"
@@ -1197,8 +1215,29 @@ def screen_dart(args: list[str]) -> None:
     return DATA_DIR / name
 
 
+def kr_minority(codes: list[str], period) -> dict:
+    """종목코드 → 그 기간 연결재무상태표의 비지배지분 (연결이 없으면 0). period: 2026Q2 또는 연도.
+    DART 회사별 호출(캐시 data/cache/dart_single). 한도 초과 등으로 못 받은 종목은 None."""
+    corps = {c["stock_code"]: c["corp_code"] for c in json.loads((DATA_DIR / "dart/listed_corps.json").read_text(encoding="utf-8"))}
+    year, q = (int(period[:4]), int(period[-1])) if "Q" in str(period) else (int(period), 4)
+    dart = DartClient(os.getenv("DART_API_KEY", ""), cache_dir=DATA_DIR / "cache/dart_single")
+    out, failed = {}, []
+    for code in codes:
+        if code not in corps:
+            continue
+        try:
+            rows = dart.financial_statements(corps[code], str(year), analysis.DART_REPORT_CODE[q], "CFS")
+        except RuntimeError as e:  # 한도 초과 등: 캐시에 있는 뒤 종목은 계속 읽도록 멈추지 않음
+            failed.append((code, str(e)[:60]))
+            continue
+        out[code] = analysis.dart_minority_interest(rows)
+    if failed:
+        print(f"비지배지분 못 받음 {len(failed)}/{len(codes)}종목 ({failed[0][1]})", flush=True)
+    return {c: out.get(c) for c in codes}
+
+
 # 값 없이 쓰는 옵션. 나머지 --옵션은 다음 인자가 값
-FLAG_OPTIONS = {"--no-profit", "--no-buyback", "--no-foreign", "--quarterly"}
+FLAG_OPTIONS = {"--no-profit", "--no-buyback", "--no-foreign", "--quarterly", "--minority"}
 
 
 def screen_tag(args: list[str]) -> str:

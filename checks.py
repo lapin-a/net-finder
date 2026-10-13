@@ -117,6 +117,15 @@ check("ACMR 옛 표지 값(1,418만 주) 대신 가중평균", (num((us_q[("ACMR
 check("AMZN 총부채 = 부채와자본총계 − 자본총계", (us_q[("AMZN", "2026Q2")] or {}).get("총부채_출처") == "부채와자본총계−자본총계")
 
 samsung = find(A / "dart/batch_상장사_연간.csv", [("005930", "2017"), ("005930", "2018")], ("종목코드", "연도"))
+sys.path.insert(0, str(ROOT))
+import analysis  # noqa: E402
+
+check("비지배지분 계정 읽기 (연결 없음 0, 음수 0)",
+      analysis.dart_minority_interest([]) == 0
+      and analysis.dart_minority_interest([{"sj_div": "BS", "account_id": "ifrs-full_NoncontrollingInterests",
+                                            "account_nm": "비지배지분", "thstrm_amount": "1,234"}]) == 1234
+      and analysis.dart_minority_interest([{"sj_div": "BS", "account_id": "x", "account_nm": "비지배지분",
+                                            "thstrm_amount": "-5"}]) == 0)
 check("삼성전자 2017 분할 배율 50 (2018년 50:1)", num((samsung[("005930", "2017")] or {}).get("분할반영_배율")) == 50)
 
 # 한국: 네 분기 순이익 합 = 연간 (4분기 = 연간 − 3분기 누적). 정정·재작성 때문에 어긋나는 회사는 README 기준 약 4%
@@ -141,6 +150,10 @@ if page.exists():
             src = A / f"dart/screen_{m[1]}_{m[2]}{m[3]}{m[4]}{RATIO_ONLY}.csv"
         else:
             src = A / f"edgar/screen_{re.search(r'\d{4}-\d\d', tab['asof'])[0]}{RATIO_ONLY}.csv"
+        if tab["cur"] == "KRW":  # 비지배지분 뺀 비율 = 시가총액 ÷ (순유동자산 − 비지배지분)
+            bad = [r["name"] for r in tab["rows"] if r.get("nci") is not None and r["ratioAdj"] is not None
+                   and not close(r["mcap"] / (r["ncav"] - r["nci"]), r["ratioAdj"])]
+            check(f"페이지 {tab['label']} 비지배지분 뺀 비율", not bad, ", ".join(bad[:5]))
         check(f"페이지 {tab['label']} 종목 수 = {src.name}", src.exists() and len(load(src)) == len(tab["rows"]),
               f"페이지 {len(tab['rows'])}, 파일 {len(load(src)) if src.exists() else '없음'}")
 
@@ -150,7 +163,6 @@ if notes.exists():
         bad = [r[0] for r in list(csv.reader(f))[1:] if len(r) != 3]
     check("manual_notes.csv 열 3개 (쉼표가 든 메모는 따옴표)", not bad, f"{bad}")
 
-sys.path.insert(0, str(ROOT))
 from main import screen_tag  # noqa: E402
 
 check("screen_tag", screen_tag([]) == "" and screen_tag(["2026Q2", "--no-profit", "--no-buyback"]) == RATIO_ONLY

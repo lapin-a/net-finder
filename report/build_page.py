@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 
 from collectors import KrxClient  # noqa: E402
-from main import screen_dart, screen_tag, us_kinds  # noqa: E402
+from main import kr_minority, screen_dart, screen_tag, us_kinds  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 A = ROOT / "data/analysis"
@@ -79,7 +79,6 @@ def us_volume(month: str) -> dict:
     return {t: v / (MONTHS * 21) for t, v in total.items()}
 
 
-HOLDING = re.compile(r"홀딩스|지주")
 NCAV_JUMP = 2  # 순유동자산이 직전 기간 중앙값의 이 배수 넘게(또는 1/배수 미만) 바뀌면 표시
 
 
@@ -94,9 +93,7 @@ def kr_history(kind: str) -> dict:
 
 
 def kr_flags(r, history: dict, period: str, back: list[str]) -> list[str]:
-    flags = []
-    if HOLDING.search(r["회사명"]):  # 연결 순유동자산에 상장 자회사 외부 주주 몫이 섞임 (한국은 비지배지분을 안 뺌)
-        flags.append("지주회사: 비지배지분 안 뺌 (순유동자산 과대 가능)")
+    flags = []  # 비지배지분 표시는 페이지에서 '비지배지분 빼기' 상태에 따라 붙임 (template.html)
     prev = [v for p, v in history.get(r["종목코드"], {}).items() if p in back]
     cur = num(r["순유동자산"])
     if len(prev) >= 2 and cur:
@@ -110,6 +107,21 @@ def kr_flags(r, history: dict, period: str, back: list[str]) -> list[str]:
 
 
 def kr(rows, volume, history, period):
+    """비지배지분(nci)과 뺀 값(ncavAdj·ratioAdj·ncavpsAdj)을 같이 넣는다. 페이지의 '비지배지분 빼기'로 둘 중 하나를 보여 줌.
+    nci가 None이면 DART에서 못 받은 것 (한도 초과 등)."""
+    minority = kr_minority([r["종목코드"] for r in rows], period)
+    out = []
+    for r, row in zip(rows, _kr_rows(rows, volume, history, period)):
+        n = minority[r["종목코드"]]
+        adj = row["ncav"] - (n or 0)
+        shares = row["mcap"] / row["price"]
+        out.append({**row, "nci": n, "ncavAdj": adj,
+                    "ratioAdj": round(row["mcap"] / adj, 3) if adj > 0 else None,
+                    "ncavpsAdj": round(adj / shares, 2)})
+    return out
+
+
+def _kr_rows(rows, volume, history, period):
     if "Q" in period:  # 직전 4분기
         y, q = int(period[:4]), int(period[-1])
         back = [f"{(y * 4 + q - 1 - k) // 4}Q{(y * 4 + q - 1 - k) % 4 + 1}" for k in range(1, 5)]

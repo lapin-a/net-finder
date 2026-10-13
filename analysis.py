@@ -146,6 +146,19 @@ def _dart_buyback_shares(treasury_rows, buyback_amount):
     return 0 if buyback_amount == 0 else None
 
 
+DART_REPORT_CODE = {q: code for code, q in DART_REPORTS}  # 분기 → 보고서 코드
+
+
+def dart_minority_interest(fs_rows) -> float:
+    """연결재무상태표 자본 안의 비지배지분 (음수면 0). 연결재무제표가 없으면(종속회사 없음) 0.
+    한국 순유동자산(연결 유동자산 − 부채총계)에는 자회사 외부 주주 몫이 섞여 있어, 미국처럼 빼 보려고 쓴다."""
+    for r in fs_rows or []:
+        if r["sj_div"] == "BS" and (r["account_id"].endswith("NoncontrollingInterests")
+                                    or r["account_nm"].replace(" ", "") in ("비지배지분", "비지배주주지분")):
+            return max(_num(r["thstrm_amount"]) or 0, 0)
+    return 0
+
+
 def dart_records(client, corp_code: str, start_year: int, end_year: int):
     quarters, annual = {}, {}
 
