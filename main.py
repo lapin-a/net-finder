@@ -29,6 +29,9 @@
     python main.py foreign-share-check 2026-09 --no-profit --no-buyback   # 해외 결과(같은 조건의 screen-edgar 파일) 중 확인 필요 종목의 표지 뒤 공시에서 발행주식수 문장 찾기 (검토용)
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
     python main.py us-prices                     # 미국 월별 주가 (Alpaca, 2016년부터) → edgar/주가_월별.csv
+    python main.py analyze-edinet-batch 2025-11-01 2026-10-31   # 일본: 그 기간에 제출된 상장사 유가증권보고서 → edinet/연간.csv
+    python main.py screen-edinet                 # 일본 넷넷: J-Quants 최신 일봉(Free는 12주 전) + 그때 제출돼 있던 최신 연간 재무
+    python main.py screen-edinet --price-date 2026-07-31 --ratio 1
 
     # 넷넷 스크리너 (analyze-dart-batch 결과 + KRX 종가·시가총액)
     python main.py screen-dart                   # 최신 연도, 기본 조건
@@ -55,7 +58,7 @@ import requests
 from dotenv import load_dotenv
 
 import analysis
-from collectors import AlpacaClient, DartClient, EdgarClient, KrxClient
+from collectors import AlpacaClient, DartClient, EdgarClient, EdinetClient, JQuantsClient, KrxClient
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -1944,6 +1947,119 @@ def save_analysis(prefix: str, quarters: dict, annual: dict) -> None:
     save_csv(f"analysis/{prefix}_연간.csv", a_rows, list(a_rows[0]) if a_rows else [])
 
 
+EDINET_ANNUAL_FIELDS = ["종목코드", "회사명", "EDINET코드", "결산일", "제출일", "회계기준", "재무기준", "유동자산", "총부채",
+                        "비지배지분", "순유동자산", "순이익", "발행주식수", "자기주식", "자기주식_출처", "주당순유동자산", "docID"]
+
+
+def analyze_edinet_batch(edinet: EdinetClient, start: date, end: date, workers: int = 4) -> None:
+    """start~end에 제출된 상장사 유가증권보고서(내국회사 제3호 서식, 정정 보고서 제외)를 읽어 edinet/연간.csv에 합친다.
+    같은 회사·같은 결산일은 나중에 제출한 보고서. 이미 있는 파일의 다른 결산일 행은 그대로 둔다.
+    순유동자산 = 유동자산 − 총부채 − 비지배지분. 주당순유동자산은 (발행주식수 − 자기주식)으로 나눔.
+    종목코드는 증권코드 5자리 중 앞 4자리 (마지막 자리는 검사 숫자 0)."""
+    docs, day = {}, start
+    while day <= end:
+        for d in edinet.documents(day):
+            if (d.get("docTypeCode") == "120" and d.get("secCode") and d.get("ordinanceCode") == "010"
+                    and d.get("formCode") == "030000" and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"):
+                docs[(d["secCode"], d["periodEnd"])] = d  # 날짜 순서라 나중 제출이 덮어씀
+        day += timedelta(days=1)
+    print(f"유가증권보고서 {len(docs)}건 ({start} ~ {end})", flush=True)
+
+    def one(d):
+        try:
+            return d, analysis.edinet_record(edinet.facts(d["docID"]))
+        except (RuntimeError, requests.RequestException) as e:
+            return d, {"error": str(e)[:80]}
+
+    path = DATA_DIR / "analysis/edinet/연간.csv"
+    rows = {(r["종목코드"], r["결산일"]): r for r in _load_csv(path)} if path.exists() else {}
+    failed = []
+    with ThreadPoolExecutor(workers) as pool:
+        for i, (d, rec) in enumerate(pool.map(one, docs.values()), 1):
+            if i % 500 == 0:
+                print(f"  {i}/{len(docs)}", flush=True)
+            if "error" in rec:
+                failed.append((d["secCode"], rec["error"]))
+                continue
+            ca, tl, nci = rec["current_assets"], rec["total_liabilities"], rec["minority"] or 0
+            ncav = ca - tl - max(nci, 0) if ca is not None and tl is not None else None
+            out_shares = rec["shares"] - rec["treasury"] if rec["shares"] else None
+            rows[(d["secCode"][:4], d["periodEnd"])] = {
+                "종목코드": d["secCode"][:4], "회사명": d["filerName"], "EDINET코드": d["edinetCode"],
+                "결산일": d["periodEnd"], "제출일": d["submitDateTime"][:10], "회계기준": rec["standard"],
+                "재무기준": rec["basis"], "유동자산": ca, "총부채": tl, "비지배지분": nci, "순유동자산": ncav,
+                "순이익": rec["net_income"], "발행주식수": rec["shares"], "자기주식": rec["treasury"],
+                "자기주식_출처": rec["treasury_source"],
+                "주당순유동자산": round(ncav / out_shares, 2) if ncav is not None and out_shares else None,
+                "docID": d["docID"],
+            }
+    if failed:
+        print(f"못 읽음 {len(failed)}건 (예: {failed[0]})", flush=True)
+    out = sorted(rows.values(), key=lambda r: (r["종목코드"], r["결산일"]))
+    save_csv("analysis/edinet/연간.csv", out, EDINET_ANNUAL_FIELDS)
+    blank = Counter(k for r in out for k in ("유동자산", "총부채", "발행주식수") if r[k] in (None, ""))
+    print(f"빈칸: {dict(blank)} / 회계기준: {dict(Counter(r['회계기준'] for r in out))}")
+
+
+SPLIT_GAP = 1.5  # 결산일 발행주식수와 주가 기준일 상장주식수가 이 배수 넘게 다르면 분할·병합으로 봄
+
+
+def screen_edinet(args: list[str]) -> Path:
+    """일본 넷넷 스크리너 (비율 조건만). 옵션: --price-date YYYY-MM-DD (기본: 받을 수 있는 최신 거래일), --ratio R (기본 2/3).
+    재무: edinet/연간.csv에서 회사별로 주가 기준일 전에 제출된 최신 결산.
+    시가총액 = 종가 × (상장주식수 − 자기주식). 상장주식수는 J-Quants MktCap ÷ 종가 (주가 기준일, 자기주식 포함).
+    자기주식은 결산일 값이라 그 뒤 바뀐 상장주식수에 맞춤: 1.5배 넘게 바뀌면 분할·병합 배율만큼 곱하고,
+    그 안에서 줄었으면(소각) 준 만큼 빼 두 번 빼지 않음. MktCap이 없는 종목은 결산일 발행주식수로."""
+    def opt(name, default):
+        return args[args.index(name) + 1] if name in args else default
+
+    jq = JQuantsClient(os.getenv("JQUANTS_API_KEY", ""), cache_dir=DATA_DIR / "cache/jquants")
+    want = date.fromisoformat(opt("--price-date", (date.today() - timedelta(days=1)).isoformat()))
+    day, bars = jq.last_trading_day(want)
+    max_ratio = float(opt("--ratio", 2 / 3))
+
+    latest = {}
+    for r in _load_csv(DATA_DIR / "analysis/edinet/연간.csv"):
+        if r["제출일"] <= day.isoformat() and (r["종목코드"] not in latest or r["결산일"] > latest[r["종목코드"]]["결산일"]):
+            latest[r["종목코드"]] = r
+    stages = {"전체": len(latest), "순유동자산>0·주가있음": 0, f"비율≤{max_ratio:g}": 0}
+    passed = []
+    for b in bars:
+        r = latest.get(b["Code"][:4]) if b["Code"].endswith("0") else None  # 5자리 끝 0 = 보통주
+        ncav, close = (float(r["순유동자산"]) if r and r["순유동자산"] else None), b.get("C")
+        if not r or ncav is None or ncav <= 0 or not close or not r["발행주식수"]:
+            continue
+        stages["순유동자산>0·주가있음"] += 1
+        issued, treasury = float(r["발행주식수"]), float(r["자기주식"] or 0)
+        listed = b["MktCap"] * 1e6 / close if b.get("MktCap") else issued
+        change = listed / issued
+        if change > SPLIT_GAP or change < 1 / SPLIT_GAP:
+            treasury *= change
+        else:
+            treasury = max(treasury - max(issued - listed, 0), 0)
+        mktcap = close * (listed - treasury)
+        ratio = mktcap / ncav
+        if ratio > max_ratio:
+            continue
+        stages[f"비율≤{max_ratio:g}"] += 1
+        passed.append({
+            "종목코드": r["종목코드"], "회사명": r["회사명"], "결산일": r["결산일"], "제출일": r["제출일"],
+            "회계기준": r["회계기준"], "재무기준": r["재무기준"], "종가": close, "시가총액": round(mktcap),
+            "시가총액(자기주식포함)": round(close * listed), "상장주식수": round(listed), "자기주식": round(treasury),
+            "분할병합배율": round(change, 3) if abs(change - 1) > 0.01 else "",
+            "유동자산": r["유동자산"], "총부채": r["총부채"], "비지배지분": r["비지배지분"], "순유동자산": ncav,
+            "주당순유동자산": round(ncav / (listed - treasury), 2), "시총÷순유동자산": round(ratio, 3),
+            "순이익": r["순이익"], "거래대금": b.get("Va"),
+        })
+    passed.sort(key=lambda x: x["시총÷순유동자산"])
+    print(f"재무 회사별 최신 연간 / 주가 기준일 {day}")
+    for name, count in stages.items():
+        print(f"  {name}: {count}")
+    name = f"analysis/edinet/screen_{day.isoformat()}{screen_tag(args)}.csv"
+    save_csv(name, passed, list(passed[0]) if passed else ["종목코드"])
+    return DATA_DIR / name
+
+
 def main(argv: list[str]) -> None:
     load_dotenv()
     if not argv:
@@ -2014,6 +2130,13 @@ def main(argv: list[str]) -> None:
 
     elif cmd == "us-prices":
         us_prices()
+
+    elif cmd == "screen-edinet":
+        screen_edinet(args)
+
+    elif cmd == "analyze-edinet-batch":
+        analyze_edinet_batch(EdinetClient(os.getenv("EDINET_API_KEY", ""), cache_dir=DATA_DIR / "cache/edinet"),
+                             date.fromisoformat(args[0]), date.fromisoformat(args[1]))
 
     elif cmd == "screen-edgar":
         screen_edgar(args)

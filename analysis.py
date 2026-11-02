@@ -11,6 +11,7 @@ DART와 EDGAR 데이터를 같은 형태로 맞춘 뒤 분기표와 연간표를
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -1508,3 +1509,78 @@ def treasury_increase_from_xbrl(parsed: dict, fy: int | None = None) -> dict:
         if out:
             return out
     return {}
+
+
+# ---------------------------------------------------------------- EDINET (일본, 유가증권보고서 XBRL→CSV)
+
+# 일본 기준(jppfs) / IFRS(jpigp). 미국 기준 회사는 재무제표 본표가 XBRL에 없어 빈칸
+EDINET_TAGS = {
+    "current_assets": ["jppfs_cor:CurrentAssets", "jpigp_cor:CurrentAssetsIFRS"],
+    "total_liabilities": ["jppfs_cor:Liabilities", "jpigp_cor:LiabilitiesIFRS"],
+    "minority": ["jppfs_cor:NonControllingInterests", "jpigp_cor:NonControllingInterestsIFRS"],
+    # 연결은 지배주주 귀속, 별도는 당기순이익
+    "net_income": ["jppfs_cor:ProfitLossAttributableToOwnersOfParent", "jpigp_cor:ProfitLossAttributableToOwnersOfParentIFRS",
+                   "jppfs_cor:ProfitLoss", "jpigp_cor:ProfitLossIFRS"],
+}
+EDINET_SHARES = ["jpcrp_cor:TotalNumberOfIssuedSharesSummaryOfBusinessResults"]
+
+
+def _edinet_name(name: str) -> str:
+    """회사명 비교용: 전각·반각 통일, 株式会社·(株)·공백 제거."""
+    name = unicodedata.normalize("NFKC", name or "")
+    return re.sub(r"株式会社|\(株\)|\s", "", name)
+
+
+def edinet_record(facts: list[dict]) -> dict:
+    """유가증권보고서 한 건 → {종료일, 회계기준, 연결, 유동자산, 총부채, 비지배지분, 순이익, 발행주식수, 자기주식 …}.
+
+    연결재무제표가 있으면 연결(컨텍스트 CurrentYearInstant), 없으면 별도(…_NonConsolidatedMember).
+    발행주식수: '발행주식' 표의 기말 보통주 수 (시가총액은 보통주 가격이라 우선주·열후주는 뺌. 東邦亜鉛: 보통 1,377만 +
+    A종 우선 300만 + B종 열후 1,754만 주), 없으면 주요 경영지표의 발행주식 총수.
+    자기주식: '자기주식 등' 표에서 회사 자신 명의 행 (자회사·관계회사가 가진 상호보유주식은 빼고 자기 명의 + 타인 명의).
+    회사 행을 못 찾으면(상호 변경 등) 표의 합계, 표가 없으면 의결권 표의 자기보유 주식, 그것도 없으면 0.
+    """
+    value = {}  # (요소, 컨텍스트) → 값
+    for r in facts:
+        value[(r["要素ID"], r["コンテキストID"])] = r["値"]
+    dei = {e.split(":")[1]: v for (e, c), v in value.items() if e.startswith("jpdei_cor:")}
+    consolidated = dei.get("WhetherConsolidatedFinancialStatementsArePreparedDEI") == "true"
+
+    def pick(tags, kind):
+        contexts = [f"CurrentYear{kind}", f"CurrentYear{kind}_NonConsolidatedMember"]
+        if not consolidated:
+            contexts.reverse()
+        for ctx in contexts:
+            for tag in tags:
+                v = _num(value.get((tag, ctx)))
+                if v is not None:
+                    return v, ("연결" if ctx == f"CurrentYear{kind}" else "별도")
+        return None, ""
+
+    rec = {"end": dei.get("CurrentPeriodEndDateDEI"), "standard": dei.get("AccountingStandardsDEI"),
+           "name": dei.get("FilerNameInJapaneseDEI"), "sec_code": dei.get("SecurityCodeDEI")}
+    rec["current_assets"], rec["basis"] = pick(EDINET_TAGS["current_assets"], "Instant")
+    rec["total_liabilities"], _ = pick(EDINET_TAGS["total_liabilities"], "Instant")
+    rec["minority"], _ = pick(EDINET_TAGS["minority"], "Instant") if rec["basis"] == "연결" else (0, "")
+    rec["net_income"], _ = pick(EDINET_TAGS["net_income"], "Duration")
+    rec["shares"] = (_num(value.get(("jpcrp_cor:NumberOfIssuedSharesAsOfFiscalYearEndIssuedSharesTotalNumberOfSharesEtc",
+                                     "FilingDateInstant_OrdinaryShareMember")))
+                     or pick(EDINET_SHARES, "Instant")[0])
+
+    # 자기주식 등 표: 행마다 이름(NameOfShareholder…)·합계(TotalNumberOfSharesHeld…), 컨텍스트 CurrentYearInstant_RowNMember
+    me = _edinet_name(rec["name"])
+    own, total = None, _num(value.get(("jpcrp_cor:TotalNumberOfSharesHeldTreasurySharesEtc", "CurrentYearInstant")))
+    for (e, c), v in value.items():
+        if e == "jpcrp_cor:NameOfShareholderTreasurySharesEtc" and _edinet_name(v) == me:
+            own = (own or 0) + (_num(value.get(("jpcrp_cor:TotalNumberOfSharesHeldTreasurySharesEtc", c))) or 0)
+    voting = [_num(v) for (e, c), v in value.items()  # 의결권 표: 완전의결권 주식 중 자기보유주식 등
+              if e == "jpcrp_cor:NumberOfSharesIssuedSharesVotingRights" and c.endswith("TreasurySharesEtcMember")]
+    if own is not None:
+        rec["treasury"], rec["treasury_source"] = own, "자기 명의 행"
+    elif total is not None:
+        rec["treasury"], rec["treasury_source"] = total, "표 합계"
+    elif any(voting):
+        rec["treasury"], rec["treasury_source"] = sum(v or 0 for v in voting), "의결권 표"
+    else:
+        rec["treasury"], rec["treasury_source"] = 0, "없음"
+    return rec

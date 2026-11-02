@@ -68,7 +68,8 @@ def formula(path):
 
 us_path = A / f"edgar/screen_{US_MONTH}{RATIO_ONLY}.csv"
 kr_paths = [p for p in (latest(f"dart/screen_20??Q?_*{KR_PAGE}.csv"), latest(f"dart/screen_20??_*{KR_PAGE}.csv")) if p]
-for p in [us_path, *kr_paths]:
+jp_paths = [p for p in [latest("edinet/screen_20??-??-??.csv")] if p]  # 일본 (비지배지분은 순유동자산에서 뺌)
+for p in [us_path, *kr_paths, *jp_paths]:
     if p.exists():
         formula(p)
     else:
@@ -162,6 +163,8 @@ if page.exists():
         if tab["cur"] == "KRW":  # asof: '재무 2026Q2 · 주가 2026-10-08' → screen_2026Q2_20261008_…
             m = re.match(r"재무 (\w+?)년? · 주가 (\d{4})-(\d\d)-(\d\d)", tab["asof"])
             src = A / f"dart/screen_{m[1]}_{m[2]}{m[3]}{m[4]}{KR_PAGE}.csv"
+        elif tab["cur"] == "JPY":  # asof: '재무 회사별 최신 연간 · 주가 2026-08-10' → edinet/screen_2026-08-10.csv
+            src = A / f"edinet/screen_{re.search(r'\d{4}-\d\d-\d\d', tab['asof'])[0]}.csv"
         else:
             src = A / f"edgar/screen_{re.search(r'\d{4}-\d\d', tab['asof'])[0]}{RATIO_ONLY}.csv"
         if tab["cur"] == "KRW":  # 비지배지분 뺀 비율 = 시가총액 ÷ (순유동자산 − 비지배지분)

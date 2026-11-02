@@ -21,8 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 
-from collectors import KrxClient  # noqa: E402
-from main import kr_minority, screen_dart, screen_tag, us_kinds  # noqa: E402
+from collectors import JQuantsClient, KrxClient  # noqa: E402
+from main import kr_minority, screen_dart, screen_edinet, screen_tag, us_kinds  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 A = ROOT / "data/analysis"
@@ -196,6 +196,46 @@ def us(rows, volume):
     return out
 
 
+JP_ASSET_HEAVY = {"銀行業", "証券、商品先物取引業", "保険業", "その他金融業", "不動産業"}  # 유동자산에 대출·판매용 부동산
+
+
+def jp_volume(jq, price_day: date) -> dict:
+    """종목코드(4자리) → 주가 기준일까지 최근 3개월 하루 평균 거래대금(엔). J-Quants 일봉 캐시 (처음엔 날짜마다 호출)."""
+    total, days, day = {}, 0, price_day
+    while day > price_day - timedelta(days=MONTHS * 30):
+        if day.weekday() < 5:
+            rows = jq.daily(day)
+            if rows:
+                days += 1
+                for b in rows:
+                    if b["Code"].endswith("0"):
+                        total[b["Code"][:4]] = total.get(b["Code"][:4], 0) + (b.get("Va") or 0)
+        day -= timedelta(days=1)
+    return {code: v / days for code, v in total.items()} if days else {}
+
+
+def jp(rows, volume, sectors, price_day: date):
+    out = []
+    for r in rows:
+        flags = []
+        age = (price_day - date.fromisoformat(r["결산일"])).days
+        if age > 180:
+            flags.append(f"재무 {age}일 전")
+        if r["분할병합배율"]:
+            flags.append(f"결산 뒤 주식수 ×{float(r['분할병합배율']):g} (분할·병합·증자 확인)")
+        sector = sectors.get(r["종목코드"], "")
+        if sector in JP_ASSET_HEAVY:
+            flags.append(f"{sector}: 대출·판매용 부동산이 유동자산")
+        out.append({
+            "code": r["종목코드"], "name": r["회사명"],
+            "ratio": num(r["시총÷순유동자산"]), "price": num(r["종가"]),
+            "ncavps": num(r["주당순유동자산"]), "mcap": num(r["시가총액"]), "ncav": num(r["순유동자산"]),
+            "ni": num(r["순이익"]), "status": "", "flags": flags,
+            "vol": round(volume.get(r["종목코드"], 0)), "kind": "",
+        })
+    return out
+
+
 def fmt_day(s):
     return f"{s[:4]}-{s[4:6]}-{s[6:]}"
 
@@ -220,6 +260,12 @@ data = {
            "asof": f"주가 {us_month} 말 · 회사별 최신 분기 재무 (해외 기업은 최신 20-F·40-F·6-K)",
            "niLabel": "순이익(최근 4분기)", "rows": us(load(us_path), us_volume(us_month))},
 }
+jq = JQuantsClient(os.getenv("JQUANTS_API_KEY", ""), cache_dir=ROOT / "data/cache/jquants")
+jp_path = screen_edinet(["--price-date", date.today().isoformat()])  # 무료 플랜은 받을 수 있는 최신 거래일로 당겨짐
+jp_day = date.fromisoformat(jp_path.stem.split("_")[1])
+jp_sectors = {m["Code"][:4]: m.get("S33Nm", "") for m in jq.master() if m["Code"].endswith("0")}
+data["jp"] = {"label": "일본 연간", "cur": "JPY", "asof": f"재무 회사별 최신 연간 · 주가 {jp_day.isoformat()}",
+              "niLabel": "순이익(최근 연간)", "rows": jp(load(jp_path), jp_volume(jq, jp_day), jp_sectors, jp_day)}
 tpl = (ROOT / "report/template.html").read_text(encoding="utf-8")
 out = A / "netnet_candidates.html"
 out.write_text(tpl.replace("/*DATA*/null", json.dumps(data, ensure_ascii=False)), encoding="utf-8")
