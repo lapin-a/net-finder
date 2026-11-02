@@ -1150,6 +1150,8 @@ def screen_dart(args: list[str]) -> None:
     --price-date YYYYMMDD  주가 기준일 (기본: 해당 연도·분기 말일, 휴장이면 직전 거래일)
     --minority           비지배지분(연결 자본)을 순유동자산에서 빼고 비율 조건을 다시 봄 (미국과 같은 방식).
                          통과 종목만 DART 회사별 호출(그 기간 연결 재무제표 1건씩, 캐시). 못 받은 종목은 남겨 둠
+    --treasury           KRX 시가총액(상장주식수 기준, 자기주식 포함)에서 그 기간 말 자기주식 × 종가를 빼고 비율 조건을 봄.
+                         자기주식 수는 주식의 총수 현황(없으면 취득·처분 현황). 전체 종목 DART 회사별 호출(기간당 약 2,700건, 캐시)
     """
     def opt(name, default):
         return args[args.index(name) + 1] if name in args else default
@@ -1191,6 +1193,8 @@ def screen_dart(args: list[str]) -> None:
     print(f"재무 {period}{'' if quarterly else '년'} / 주가 기준일 {bas_dd}"
           + (f" / 자사주매입 {buyback_year}년 vs {buyback_year - 1}년" if buyback_year else ""))
 
+    if "--treasury" in args:
+        kr_treasury(market, rows, period)
     passed, stages = analysis.screen_net_net(rows, period, market, max_ratio, profit_years, profit_status,
                                              buyback_up="--no-buyback" not in args, buyback=buyback)
     if "--minority" in args:  # 비지배지분을 순유동자산에서 빼고 비율 조건을 다시 봄 (통과 종목만 DART 회사별 호출, 캐시)
@@ -1236,8 +1240,50 @@ def kr_minority(codes: list[str], period) -> dict:
     return {c: out.get(c) for c in codes}
 
 
+def kr_treasury(market: dict, rows: list[dict], period) -> None:
+    """market(KRX market_data)의 시가총액·주식수에서 그 기간 말 자기주식을 뺀다 (제자리 수정).
+    금액 = 보통주 자기주식 × 보통주 종가 + 우선주 자기주식 × 우선주 평균가. 바꾼 종목에는 treasury(주식수)·mktcap_listed(원래 값).
+    기간 말 뒤 상장주식수가 줄었으면(자기주식 소각 등) 준 만큼 자기주식에서 빼 두 번 빼지 않게 한다.
+    자기주식 현황이 없거나(미공시) 못 받은 종목은 그대로 둔다."""
+    corps = {c["stock_code"]: c["corp_code"] for c in json.loads((DATA_DIR / "dart/listed_corps.json").read_text(encoding="utf-8"))}
+    year, q = (int(period[:4]), int(period[-1])) if "Q" in str(period) else (int(period), 4)
+    key = "기간" if "Q" in str(period) else "연도"
+    issued = {r["종목코드"]: int(float(r["발행주식수"])) for r in rows if str(r[key]) == str(period) and r["발행주식수"]}
+    dart = DartClient(os.getenv("DART_API_KEY", ""), cache_dir=DATA_DIR / "cache/dart_single")
+    for m in market.values():  # 결과 CSV 열이 첫 행 기준이라 모든 종목에 넣음 (안 뺀 종목은 빈칸)
+        m["treasury"], m["mktcap_listed"] = None, m["mktcap"]
+    adjusted, missing, failed = 0, 0, []
+    for code in issued:
+        m = market.get(code)
+        if not m or code not in corps:
+            continue
+        try:
+            reprt = analysis.DART_REPORT_CODE[q]
+            end = analysis.dart_treasury_end(dart.share_counts(corps[code], str(year), reprt),
+                                             dart.treasury_stock(corps[code], str(year), reprt))
+        except RuntimeError as e:
+            failed.append((code, str(e)[:60]))
+            continue
+        if end is None:
+            missing += 1
+            continue
+        retired = max(issued[code] - m["shares"], 0)  # 기간 말 뒤 줄어든 상장주식수
+        common = max(end["보통주"] - retired, 0)
+        pref = max(end["우선주"] - max(retired - end["보통주"], 0), 0) if m["pref_shares"] else 0
+        if common + pref == 0 or common + pref >= m["shares"]:
+            continue
+        pref_price = m["pref_mktcap"] / m["pref_shares"] if m["pref_shares"] else 0
+        m["mktcap_listed"] = m["mktcap"]
+        m["treasury"] = common + pref
+        m["mktcap"] = round(m["mktcap"] - common * m["close"] - pref * pref_price)
+        m["shares"] -= common + pref
+        adjusted += 1
+    print(f"자기주식 차감 {adjusted}종목 (자기주식 현황 미공시 {missing}"
+          + (f", 못 받음 {len(failed)}: {failed[0][1]}" if failed else "") + ")", flush=True)
+
+
 # 값 없이 쓰는 옵션. 나머지 --옵션은 다음 인자가 값
-FLAG_OPTIONS = {"--no-profit", "--no-buyback", "--no-foreign", "--quarterly", "--minority"}
+FLAG_OPTIONS = {"--no-profit", "--no-buyback", "--no-foreign", "--quarterly", "--minority", "--treasury"}
 
 
 def screen_tag(args: list[str]) -> str:

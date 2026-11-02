@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent
 A = ROOT / "data/analysis"
 US_MONTH = "2026-09"  # 아래 확인한 종목 값의 기준 월
 RATIO_ONLY = "_no-buyback_no-profit"
+KR_PAGE = RATIO_ONLY + "_treasury"  # 한국 목록 페이지는 자기주식 뺀 시가총액
 failures = []
 
 
@@ -66,12 +67,17 @@ def formula(path):
 
 
 us_path = A / f"edgar/screen_{US_MONTH}{RATIO_ONLY}.csv"
-kr_paths = [p for p in (latest(f"dart/screen_20??Q?_*{RATIO_ONLY}.csv"), latest(f"dart/screen_20??_*{RATIO_ONLY}.csv")) if p]
+kr_paths = [p for p in (latest(f"dart/screen_20??Q?_*{KR_PAGE}.csv"), latest(f"dart/screen_20??_*{KR_PAGE}.csv")) if p]
 for p in [us_path, *kr_paths]:
     if p.exists():
         formula(p)
     else:
         check(f"파일 {p.name}", False, "없음")
+for p in kr_paths:  # 자기주식 뺀 시가총액: 0 < 시가총액 < 자기주식 포함 값, 자기주식 < 발행주식의 절반
+    bad = [r["종목코드"] for r in load(p) if r["자기주식"] and not (
+        0 < num(r["시가총액"]) < num(r["시가총액(자기주식포함)"])
+        and num(r["자기주식"]) < num(r["시가총액"]) / num(r["종가"]))]
+    check(f"자기주식 차감 {p.name}", not bad, ", ".join(bad[:5]))
 
 # ---------------------------------------------------------------- 확인한 종목 (미국 2026-09, 비율만)
 
@@ -126,6 +132,14 @@ check("비지배지분 계정 읽기 (연결 없음 0, 음수 0)",
                                             "account_nm": "비지배지분", "thstrm_amount": "1,234"}]) == 1234
       and analysis.dart_minority_interest([{"sj_div": "BS", "account_id": "x", "account_nm": "비지배지분",
                                             "thstrm_amount": "-5"}]) == 0)
+dash = [{"acqs_mth1": "-", "stock_knd": "-", "trmend_qy": "-"}]  # CJ대한통운 2026 반기 취득·처분 현황 ('-'만)
+cj = [{"se": "보통주", "istc_totqy": "22,812,344", "tesstk_co": "2,867,215"},
+      {"se": "우선주", "istc_totqy": "-", "tesstk_co": "-"}, {"se": "합계", "istc_totqy": "22,812,344", "tesstk_co": "2,867,215"}]
+check("자기주식 수: 총수 현황 우선 (CJ대한통운 2026 반기 287만 주), 없으면 취득·처분 총계",
+      analysis.dart_treasury_end(cj, dash) == {"보통주": 2_867_215, "우선주": 0}
+      and analysis.dart_treasury_end([], [{"acqs_mth1": "총계", "stock_knd": "우선주", "trmend_qy": "1,000"}])
+      == {"보통주": 0, "우선주": 1000}
+      and analysis.dart_treasury_end([], dash) is None)
 check("삼성전자 2017 분할 배율 50 (2018년 50:1)", num((samsung[("005930", "2017")] or {}).get("분할반영_배율")) == 50)
 
 # 한국: 네 분기 순이익 합 = 연간 (4분기 = 연간 − 3분기 누적). 정정·재작성 때문에 어긋나는 회사는 README 기준 약 4%
@@ -147,7 +161,7 @@ if page.exists():
     for key, tab in data.items():
         if tab["cur"] == "KRW":  # asof: '재무 2026Q2 · 주가 2026-10-08' → screen_2026Q2_20261008_…
             m = re.match(r"재무 (\w+?)년? · 주가 (\d{4})-(\d\d)-(\d\d)", tab["asof"])
-            src = A / f"dart/screen_{m[1]}_{m[2]}{m[3]}{m[4]}{RATIO_ONLY}.csv"
+            src = A / f"dart/screen_{m[1]}_{m[2]}{m[3]}{m[4]}{KR_PAGE}.csv"
         else:
             src = A / f"edgar/screen_{re.search(r'\d{4}-\d\d', tab['asof'])[0]}{RATIO_ONLY}.csv"
         if tab["cur"] == "KRW":  # 비지배지분 뺀 비율 = 시가총액 ÷ (순유동자산 − 비지배지분)

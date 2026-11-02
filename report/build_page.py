@@ -2,7 +2,8 @@
 
     python report/build_page.py
 
-한국: 최신 분기·최신 연도 재무에 최근 거래일(어제 이전) 주가로 screen-dart를 비율 조건만으로 돌린다 (DART 호출 없음, KRX 캐시).
+한국: 최신 분기·최신 연도 재무에 최근 거래일(어제 이전) 주가로 screen-dart를 비율 조건만으로 돌린다 (KRX 캐시).
+  시가총액은 자기주식을 뺀 값 (--treasury, DART 주식의 총수 현황 전체 종목 호출, 캐시).
 미국: 주가 파일의 최신 월 screen-edgar 결과(--no-profit --no-buyback 파일)를 읽는다. 없으면 먼저 그 명령을 실행하라고 알린다.
 결과를 report/template.html에 넣는다.
 거래대금: 주가 기준일까지 최근 3개월 하루 평균 (한국 KRX 일별 거래대금, 미국 Alpaca 월봉 VWAP × 거래량 ÷ 거래일).
@@ -101,6 +102,10 @@ def kr_flags(r, history: dict, period: str, back: list[str]) -> list[str]:
         if med <= 0 or not 1 / NCAV_JUMP <= cur / med <= NCAV_JUMP:
             flags.append(f"순유동자산 급변: 직전 {len(back)}{'분기' if 'Q' in period else '년'} 중앙값 "
                          f"{med / 1e8:,.0f}억 → {cur / 1e8:,.0f}억 원")
+    listed = num(r.get("시가총액(자기주식포함)"))
+    if listed and listed / num(r["순유동자산"]) > 2 / 3:  # 자기주식을 빼서 2/3 안으로 들어온 종목
+        flags.append(f"자기주식 {num(r['자기주식']) / (num(r['자기주식']) + num(r['시가총액']) / num(r['종가'])):.0%} 빼고 통과 "
+                     f"(포함 시 비율 {listed / num(r['순유동자산']):.2f})")
     if r["종목코드"] in NOTES:  # manual_notes.csv (한국은 종목코드)
         flags.append(NOTES[r["종목코드"]])
     return flags
@@ -198,8 +203,8 @@ def fmt_day(s):
 RATIO_ONLY = ["--no-profit", "--no-buyback"]  # 목록 페이지는 비율 조건만
 krx = KrxClient(os.getenv("KRX_API_KEY", ""), cache_dir=ROOT / "data/cache/krx")
 price_day, _ = krx.last_trading_day(date.today() - timedelta(days=1))  # 오늘 자료는 장 마감 뒤에야 나옴
-kr_q_path = screen_dart(["--quarterly", *RATIO_ONLY, "--price-date", price_day])
-kr_y_path = screen_dart([*RATIO_ONLY, "--price-date", price_day])
+kr_q_path = screen_dart(["--quarterly", *RATIO_ONLY, "--treasury", "--price-date", price_day])  # 한국은 자기주식 뺀 시가총액
+kr_y_path = screen_dart([*RATIO_ONLY, "--treasury", "--price-date", price_day])
 kr_q, kr_y = kr_q_path.stem.split("_")[1], kr_y_path.stem.split("_")[1]  # screen_<기간>_<기준일>_<조건>
 us_month = max(r["월"] for r in load(A / "edgar/주가_월별.csv"))
 us_path = A / f"edgar/screen_{us_month}{screen_tag(RATIO_ONLY)}.csv"

@@ -66,12 +66,14 @@ class KrxClient:
         우선주는 종목코드 앞 5자리가 같고 이름이 보통주 이름으로 시작하면 보통주에 합산한다.
         (예: 005930 삼성전자 + 005935 삼성전자우). 이름이 줄여 쓰였어도 앞 5자리가 같은 보통주가
         하나뿐이고 이름이 '우', '2우B' 등으로 끝나면 합산한다. 종가는 보통주 종가.
+        합산한 우선주의 시가총액·주식수는 pref_mktcap·pref_shares에도 따로 둔다 (자기주식 우선주 금액 계산용).
         """
         bas_dd, kospi = self.last_trading_day(on_or_before)
         rows = kospi + self.daily("KOSDAQ", bas_dd) + self.daily("KONEX", bas_dd)
 
         def item(r):
-            return {"close": int(r["TDD_CLSPRC"]), "mktcap": int(r["MKTCAP"]), "shares": int(r["LIST_SHRS"])}
+            return {"close": int(r["TDD_CLSPRC"]), "mktcap": int(r["MKTCAP"]), "shares": int(r["LIST_SHRS"]),
+                    "pref_mktcap": 0, "pref_shares": 0}
 
         commons = {r["ISU_CD"]: r for r in rows if r["ISU_CD"].endswith("0")}
         data = {code: item(r) for code, r in commons.items()}
@@ -83,8 +85,9 @@ class KrxClient:
             if common is None and len(same_prefix) == 1 and PREFERRED_NAME.search(r["ISU_NM"]):
                 common = same_prefix[0]  # 이름이 줄여 쓰인 우선주 (예: 남선알미늄 → 남선알미우)
             if common:
-                data[common["ISU_CD"]]["mktcap"] += int(r["MKTCAP"])
-                data[common["ISU_CD"]]["shares"] += int(r["LIST_SHRS"])
+                for key, col in (("mktcap", "MKTCAP"), ("shares", "LIST_SHRS")):
+                    data[common["ISU_CD"]][key] += int(r[col])
+                    data[common["ISU_CD"]][f"pref_{key}"] += int(r[col])
             else:
                 data[r["ISU_CD"]] = item(r)
         return bas_dd, data

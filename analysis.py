@@ -146,6 +146,25 @@ def _dart_buyback_shares(treasury_rows, buyback_amount):
     return 0 if buyback_amount == 0 else None
 
 
+def dart_treasury_end(share_rows, treasury_rows=None) -> dict | None:
+    """기말 자기주식 수량 {'보통주': n, '우선주': n}. '-'는 0.
+
+    주식의 총수 현황(share_rows)의 자기주식수(tesstk_co)를 먼저 쓴다. 자기주식 취득·처분 현황(treasury_rows)은
+    표를 '-'로만 채운 회사가 많아(CJ대한통운 2026 반기: 표는 '-', 총수 현황은 287만 주) 총수 현황이 없을 때만 총계 행을 쓴다.
+    보통주가 아닌 종류(우선주·종류주)는 우선주로 합친다. 둘 다 없으면 None."""
+    kinds = [r for r in share_rows or [] if r["se"] not in ("합계", "비고")]
+    if any(_num(r["istc_totqy"]) for r in kinds):
+        rows = [(r["se"], r["tesstk_co"]) for r in kinds]
+    else:
+        rows = [(r["stock_knd"], r["trmend_qy"]) for r in treasury_rows or [] if r["acqs_mth1"] == "총계"]
+        if not rows:
+            return None
+    out = {"보통주": 0, "우선주": 0}
+    for kind, qty in rows:
+        out["보통주" if kind == "보통주" else "우선주"] += _num(qty) or 0
+    return out
+
+
 DART_REPORT_CODE = {q: code for code, q in DART_REPORTS}  # 분기 → 보고서 코드
 
 
@@ -1069,6 +1088,7 @@ def screen_net_net(rows: list[dict], period, market: dict[str, dict], max_ratio:
         passed.append({
             "종목코드": code, "회사명": r["회사명"], ("기간" if quarterly else "연도"): period,
             "종가": m["close"], "시가총액": m["mktcap"],
+            **({"자기주식": m["treasury"], "시가총액(자기주식포함)": m["mktcap_listed"]} if "treasury" in m else {}),
             "유동자산": ca, "총부채": tl, **({"총부채_출처": r.get("총부채_출처") or ""} if "총부채_출처" in r else {}),
             **({"우선주": preferred, "우선주_출처": r.get("우선주_출처", ""), "비지배지분": minority} if "우선주" in r else {}),
             "순유동자산": ncav,
