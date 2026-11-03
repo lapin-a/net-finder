@@ -30,6 +30,7 @@
     python main.py merge-edgar                   # 글자별 결과를 edgar/연간.csv, edgar/분기.csv로 합침
     python main.py us-prices                     # 미국 월별 주가 (Alpaca, 2016년부터) → edgar/주가_월별.csv
     python main.py analyze-edinet-batch 2025-11-01 2026-10-31   # 일본: 그 기간에 제출된 상장사 유가증권보고서 → edinet/연간.csv
+    python main.py analyze-edinet-batch 2025-11-01 2026-10-31 --half   # 반기보고서(2024년 3월까지는 2분기 보고서) → edinet/반기.csv
     python main.py screen-edinet                 # 일본 넷넷: J-Quants 최신 일봉(Free는 12주 전) + 그때 제출돼 있던 최신 연간 재무
     python main.py screen-edinet --price-date 2026-07-31 --ratio 1
 
@@ -1947,23 +1948,35 @@ def save_analysis(prefix: str, quarters: dict, annual: dict) -> None:
     save_csv(f"analysis/{prefix}_연간.csv", a_rows, list(a_rows[0]) if a_rows else [])
 
 
-EDINET_ANNUAL_FIELDS = ["종목코드", "회사명", "EDINET코드", "결산일", "제출일", "회계기준", "재무기준", "유동자산", "총부채",
+EDINET_ANNUAL_FIELDS = ["종목코드", "회사명", "EDINET코드", "결산일", "제출일", "출처", "회계기준", "재무기준", "유동자산", "총부채",
                         "비지배지분", "순유동자산", "순이익", "발행주식수", "자기주식", "자기주식_출처", "주당순유동자산", "docID"]
+EDINET_PRIOR = "전기말(다음 연도 보고서)"
 
 
-def analyze_edinet_batch(edinet: EdinetClient, start: date, end: date, workers: int = 4) -> None:
+def _edinet_half_doc(d) -> bool:
+    """반기 재무: 2024년 4월부터 반기보고서(160, 제4호의3 서식), 그 전은 분기보고서(140) 중 2분기."""
+    return (d.get("docTypeCode") == "160" and d.get("formCode") == "043A00"
+            or d.get("docTypeCode") == "140" and d.get("formCode") == "043000" and "第2四半期" in (d.get("docDescription") or ""))
+
+
+def analyze_edinet_batch(edinet: EdinetClient, start: date, end: date, workers: int = 4, half: bool = False) -> None:
     """start~end에 제출된 상장사 유가증권보고서(내국회사 제3호 서식, 정정 보고서 제외)를 읽어 edinet/연간.csv에 합친다.
+    half면 반기보고서(2024년 3월까지는 2분기 보고서)를 edinet/반기.csv에 (결산일 = 반기말, 순이익 = 반기 6개월, 전기말 없음).
     같은 회사·같은 결산일은 나중에 제출한 보고서. 이미 있는 파일의 다른 결산일 행은 그대로 둔다.
+    보고서마다 전기말 값도 읽어, 그 결산일의 보고서 행이 없을 때만 채운다 (출처 '전기말(다음 연도 보고서)', 자기주식 빈칸).
     순유동자산 = 유동자산 − 총부채 − 비지배지분. 주당순유동자산은 (발행주식수 − 자기주식)으로 나눔.
     종목코드는 증권코드 5자리 중 앞 4자리 (마지막 자리는 검사 숫자 0)."""
     docs, day = {}, start
     while day <= end:
         for d in edinet.documents(day):
-            if (d.get("docTypeCode") == "120" and d.get("secCode") and d.get("ordinanceCode") == "010"
-                    and d.get("formCode") == "030000" and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"):
-                docs[(d["secCode"], d["periodEnd"])] = d  # 날짜 순서라 나중 제출이 덮어씀
+            wanted = (_edinet_half_doc(d) if half
+                      else d.get("docTypeCode") == "120" and d.get("formCode") == "030000")
+            if (wanted and d.get("secCode") and d.get("ordinanceCode") == "010"
+                    and d.get("csvFlag") == "1" and d.get("withdrawalStatus") == "0"):
+                # 날짜 순서라 나중 제출이 덮어씀. 반기보고서 목록의 periodEnd는 회계연도 말이라 서류 종류와 같이 키로
+                docs[(d["secCode"], d["periodEnd"], d["docTypeCode"])] = d
         day += timedelta(days=1)
-    print(f"유가증권보고서 {len(docs)}건 ({start} ~ {end})", flush=True)
+    print(f"{'반기' if half else '유가증권'}보고서 {len(docs)}건 ({start} ~ {end})", flush=True)
 
     def one(d):
         try:
@@ -1971,9 +1984,25 @@ def analyze_edinet_batch(edinet: EdinetClient, start: date, end: date, workers: 
         except (RuntimeError, requests.RequestException) as e:
             return d, {"error": str(e)[:80]}
 
-    path = DATA_DIR / "analysis/edinet/연간.csv"
+    kind = "반기" if half else "연간"
+    path = DATA_DIR / f"analysis/edinet/{kind}.csv"
     rows = {(r["종목코드"], r["결산일"]): r for r in _load_csv(path)} if path.exists() else {}
-    failed = []
+    prior_rows, failed = {}, []
+
+    def row(d, rec, source):
+        ca, tl, nci = rec["current_assets"], rec["total_liabilities"], rec["minority"] or 0
+        ncav = ca - tl - max(nci, 0) if ca is not None and tl is not None else None
+        out_shares = rec["shares"] - (rec["treasury"] or 0) if rec["shares"] else None
+        return {
+            "종목코드": d["secCode"][:4], "회사명": d["filerName"], "EDINET코드": d["edinetCode"],
+            "결산일": rec["end"], "제출일": d["submitDateTime"][:10], "출처": source, "회계기준": rec["standard"],
+            "재무기준": rec["basis"], "유동자산": ca, "총부채": tl, "비지배지분": nci, "순유동자산": ncav,
+            "순이익": rec["net_income"], "발행주식수": rec["shares"], "자기주식": rec["treasury"],
+            "자기주식_출처": rec["treasury_source"],
+            "주당순유동자산": round(ncav / out_shares, 2) if ncav is not None and out_shares else None,
+            "docID": d["docID"],
+        }
+
     with ThreadPoolExecutor(workers) as pool:
         for i, (d, rec) in enumerate(pool.map(one, docs.values()), 1):
             if i % 500 == 0:
@@ -1981,22 +2010,21 @@ def analyze_edinet_batch(edinet: EdinetClient, start: date, end: date, workers: 
             if "error" in rec:
                 failed.append((d["secCode"], rec["error"]))
                 continue
-            ca, tl, nci = rec["current_assets"], rec["total_liabilities"], rec["minority"] or 0
-            ncav = ca - tl - max(nci, 0) if ca is not None and tl is not None else None
-            out_shares = rec["shares"] - rec["treasury"] if rec["shares"] else None
-            rows[(d["secCode"][:4], d["periodEnd"])] = {
-                "종목코드": d["secCode"][:4], "회사명": d["filerName"], "EDINET코드": d["edinetCode"],
-                "결산일": d["periodEnd"], "제출일": d["submitDateTime"][:10], "회계기준": rec["standard"],
-                "재무기준": rec["basis"], "유동자산": ca, "총부채": tl, "비지배지분": nci, "순유동자산": ncav,
-                "순이익": rec["net_income"], "발행주식수": rec["shares"], "자기주식": rec["treasury"],
-                "자기주식_출처": rec["treasury_source"],
-                "주당순유동자산": round(ncav / out_shares, 2) if ncav is not None and out_shares else None,
-                "docID": d["docID"],
-            }
+            if not half:
+                rec["end"] = d["periodEnd"]
+            rows[(d["secCode"][:4], rec["end"])] = row(d, rec, rec["period"] if half else "당기")
+            if rec.get("prior"):
+                prior_rows[(d["secCode"][:4], rec["prior"]["end"])] = row(d, rec["prior"], EDINET_PRIOR)
+    added = 0
+    for key, r in prior_rows.items():  # 그 결산일 보고서 행이 없거나 전에 전기말로 채운 행만
+        if key not in rows or rows[key].get("출처") == EDINET_PRIOR:
+            added += key not in rows
+            rows[key] = r
+    print(f"전기말 값으로 새로 채운 결산일 {added}건", flush=True)
     if failed:
         print(f"못 읽음 {len(failed)}건 (예: {failed[0]})", flush=True)
     out = sorted(rows.values(), key=lambda r: (r["종목코드"], r["결산일"]))
-    save_csv("analysis/edinet/연간.csv", out, EDINET_ANNUAL_FIELDS)
+    save_csv(f"analysis/edinet/{kind}.csv", out, EDINET_ANNUAL_FIELDS)
     blank = Counter(k for r in out for k in ("유동자산", "총부채", "발행주식수") if r[k] in (None, ""))
     print(f"빈칸: {dict(blank)} / 회계기준: {dict(Counter(r['회계기준'] for r in out))}")
 
@@ -2006,7 +2034,8 @@ SPLIT_GAP = 1.5  # 결산일 발행주식수와 주가 기준일 상장주식수
 
 def screen_edinet(args: list[str]) -> Path:
     """일본 넷넷 스크리너 (비율 조건만). 옵션: --price-date YYYY-MM-DD (기본: 받을 수 있는 최신 거래일), --ratio R (기본 2/3).
-    재무: edinet/연간.csv에서 회사별로 주가 기준일 전에 제출된 최신 결산.
+    재무: 회사별로 주가 기준일 전에 제출된 최신 재무상태표 (edinet/연간.csv·반기.csv 중 결산일이 늦은 쪽),
+    순이익은 최신 연간 (반기 순이익은 6개월이라 섞지 않음).
     시가총액 = 종가 × (상장주식수 − 자기주식). 상장주식수는 J-Quants MktCap ÷ 종가 (주가 기준일, 자기주식 포함).
     자기주식은 결산일 값이라 그 뒤 바뀐 상장주식수에 맞춤: 1.5배 넘게 바뀌면 분할·병합 배율만큼 곱하고,
     그 안에서 줄었으면(소각) 준 만큼 빼 두 번 빼지 않음. MktCap이 없는 종목은 결산일 발행주식수로."""
@@ -2018,10 +2047,18 @@ def screen_edinet(args: list[str]) -> Path:
     day, bars = jq.last_trading_day(want)
     max_ratio = float(opt("--ratio", 2 / 3))
 
+    def newest(kind):
+        out, path = {}, DATA_DIR / f"analysis/edinet/{kind}.csv"
+        for r in _load_csv(path) if path.exists() else []:
+            if r["제출일"] <= day.isoformat() and (r["종목코드"] not in out or r["결산일"] > out[r["종목코드"]]["결산일"]):
+                out[r["종목코드"]] = r
+        return out
+
+    annual, half = newest("연간"), newest("반기")
     latest = {}
-    for r in _load_csv(DATA_DIR / "analysis/edinet/연간.csv"):
-        if r["제출일"] <= day.isoformat() and (r["종목코드"] not in latest or r["결산일"] > latest[r["종목코드"]]["결산일"]):
-            latest[r["종목코드"]] = r
+    for code, r in annual.items():
+        h = half.get(code)
+        latest[code] = {**h, "순이익": r["순이익"], "보고서": "반기"} if h and h["결산일"] > r["결산일"] else {**r, "보고서": "연간"}
     stages = {"전체": len(latest), "순유동자산>0·주가있음": 0, f"비율≤{max_ratio:g}": 0}
     passed = []
     for b in bars:
@@ -2043,7 +2080,7 @@ def screen_edinet(args: list[str]) -> Path:
             continue
         stages[f"비율≤{max_ratio:g}"] += 1
         passed.append({
-            "종목코드": r["종목코드"], "회사명": r["회사명"], "결산일": r["결산일"], "제출일": r["제출일"],
+            "종목코드": r["종목코드"], "회사명": r["회사명"], "결산일": r["결산일"], "보고서": r["보고서"], "제출일": r["제출일"],
             "회계기준": r["회계기준"], "재무기준": r["재무기준"], "종가": close, "시가총액": round(mktcap),
             "시가총액(자기주식포함)": round(close * listed), "상장주식수": round(listed), "자기주식": round(treasury),
             "분할병합배율": round(change, 3) if abs(change - 1) > 0.01 else "",
@@ -2052,7 +2089,7 @@ def screen_edinet(args: list[str]) -> Path:
             "순이익": r["순이익"], "거래대금": b.get("Va"),
         })
     passed.sort(key=lambda x: x["시총÷순유동자산"])
-    print(f"재무 회사별 최신 연간 / 주가 기준일 {day}")
+    print(f"재무 회사별 최신 연간·반기 (반기가 더 최근 {sum(r['보고서'] == '반기' for r in latest.values())}곳) / 주가 기준일 {day}")
     for name, count in stages.items():
         print(f"  {name}: {count}")
     name = f"analysis/edinet/screen_{day.isoformat()}{screen_tag(args)}.csv"
@@ -2136,7 +2173,7 @@ def main(argv: list[str]) -> None:
 
     elif cmd == "analyze-edinet-batch":
         analyze_edinet_batch(EdinetClient(os.getenv("EDINET_API_KEY", ""), cache_dir=DATA_DIR / "cache/edinet"),
-                             date.fromisoformat(args[0]), date.fromisoformat(args[1]))
+                             date.fromisoformat(args[0]), date.fromisoformat(args[1]), half="--half" in args)
 
     elif cmd == "screen-edgar":
         screen_edgar(args)

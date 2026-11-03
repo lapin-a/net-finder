@@ -221,6 +221,8 @@ def jp(rows, volume, sectors, price_day: date):
         age = (price_day - date.fromisoformat(r["결산일"])).days
         if age > 180:
             flags.append(f"재무 {age}일 전")
+        if r.get("보고서") == "반기":
+            flags.append(f"반기 재무 ({r['결산일']})")
         if r["분할병합배율"]:
             flags.append(f"결산 뒤 주식수 ×{float(r['분할병합배율']):g} (분할·병합·증자 확인)")
         sector = sectors.get(r["종목코드"], "")
@@ -264,7 +266,7 @@ jq = JQuantsClient(os.getenv("JQUANTS_API_KEY", ""), cache_dir=ROOT / "data/cach
 jp_path = screen_edinet(["--price-date", date.today().isoformat()])  # 무료 플랜은 받을 수 있는 최신 거래일로 당겨짐
 jp_day = date.fromisoformat(jp_path.stem.split("_")[1])
 jp_sectors = {m["Code"][:4]: m.get("S33Nm", "") for m in jq.master() if m["Code"].endswith("0")}
-data["jp"] = {"label": "일본 연간", "cur": "JPY", "asof": f"재무 회사별 최신 연간 · 주가 {jp_day.isoformat()}",
+data["jp"] = {"label": "일본", "cur": "JPY", "asof": f"재무 회사별 최신 연간·반기 · 주가 {jp_day.isoformat()}",
               "niLabel": "순이익(최근 연간)", "rows": jp(load(jp_path), jp_volume(jq, jp_day), jp_sectors, jp_day)}
 tpl = (ROOT / "report/template.html").read_text(encoding="utf-8")
 out = A / "netnet_candidates.html"

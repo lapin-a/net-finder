@@ -1523,6 +1523,10 @@ EDINET_TAGS = {
                    "jppfs_cor:ProfitLoss", "jpigp_cor:ProfitLossIFRS"],
 }
 EDINET_SHARES = ["jpcrp_cor:TotalNumberOfIssuedSharesSummaryOfBusinessResults"]
+# 보고서 종류(DEI TypeOfCurrentPeriod) → (당기 시점 컨텍스트, 당기 기간 컨텍스트). 반기는 반기말·반기 누적,
+# 분기보고서(2024년 3월까지)는 분기말·연초 누적
+EDINET_CONTEXTS = {"FY": ("CurrentYearInstant", "CurrentYearDuration"), "HY": ("InterimInstant", "InterimDuration"),
+                   "Q": ("CurrentQuarterInstant", "CurrentYTDDuration")}
 
 
 def _edinet_name(name: str) -> str:
@@ -1532,9 +1536,12 @@ def _edinet_name(name: str) -> str:
 
 
 def edinet_record(facts: list[dict]) -> dict:
-    """유가증권보고서 한 건 → {종료일, 회계기준, 연결, 유동자산, 총부채, 비지배지분, 순이익, 발행주식수, 자기주식 …}.
+    """유가증권보고서·반기보고서·분기보고서 한 건 → {종료일, 기간종류, 회계기준, 연결, 유동자산, 총부채, 비지배지분, 순이익,
+    발행주식수, 자기주식 …}. 반기·분기의 순이익은 연초부터 누적 (반기 = 6개월).
+    "prior"(유가증권보고서만): 같은 보고서의 전기말 값 (재무상태표 전기말·손익 전기·주요 경영지표 전기말 발행주식수, 자기주식은 XBRL 숫자가
+    없어 None). 그 결산일 보고서를 못 받은 해(EDINET 10년 밖 등)를 채우는 데 씀.
 
-    연결재무제표가 있으면 연결(컨텍스트 CurrentYearInstant), 없으면 별도(…_NonConsolidatedMember).
+    연결재무제표가 있으면 연결(컨텍스트 CurrentYearInstant 등), 없으면 별도(…_NonConsolidatedMember).
     발행주식수: '발행주식' 표의 기말 보통주 수 (시가총액은 보통주 가격이라 우선주·열후주는 뺌. 東邦亜鉛: 보통 1,377만 +
     A종 우선 300만 + B종 열후 1,754만 주), 없으면 주요 경영지표의 발행주식 총수.
     자기주식: '자기주식 등' 표에서 회사 자신 명의 행 (자회사·관계회사가 가진 상호보유주식은 빼고 자기 명의 + 타인 명의).
@@ -1546,35 +1553,38 @@ def edinet_record(facts: list[dict]) -> dict:
     dei = {e.split(":")[1]: v for (e, c), v in value.items() if e.startswith("jpdei_cor:")}
     consolidated = dei.get("WhetherConsolidatedFinancialStatementsArePreparedDEI") == "true"
 
-    def pick(tags, kind):
-        contexts = [f"CurrentYear{kind}", f"CurrentYear{kind}_NonConsolidatedMember"]
+    period = dei.get("TypeOfCurrentPeriodDEI") or "FY"
+    instant, duration = EDINET_CONTEXTS["Q" if period.startswith("Q") else period]
+
+    def pick(tags, base):
+        contexts = [base, f"{base}_NonConsolidatedMember"]
         if not consolidated:
             contexts.reverse()
         for ctx in contexts:
             for tag in tags:
                 v = _num(value.get((tag, ctx)))
                 if v is not None:
-                    return v, ("연결" if ctx == f"CurrentYear{kind}" else "별도")
+                    return v, ("연결" if ctx == base else "별도")
         return None, ""
 
-    rec = {"end": dei.get("CurrentPeriodEndDateDEI"), "standard": dei.get("AccountingStandardsDEI"),
+    rec = {"end": dei.get("CurrentPeriodEndDateDEI"), "period": period, "standard": dei.get("AccountingStandardsDEI"),
            "name": dei.get("FilerNameInJapaneseDEI"), "sec_code": dei.get("SecurityCodeDEI")}
-    rec["current_assets"], rec["basis"] = pick(EDINET_TAGS["current_assets"], "Instant")
-    rec["total_liabilities"], _ = pick(EDINET_TAGS["total_liabilities"], "Instant")
-    rec["minority"], _ = pick(EDINET_TAGS["minority"], "Instant") if rec["basis"] == "연결" else (0, "")
-    rec["net_income"], _ = pick(EDINET_TAGS["net_income"], "Duration")
+    rec["current_assets"], rec["basis"] = pick(EDINET_TAGS["current_assets"], instant)
+    rec["total_liabilities"], _ = pick(EDINET_TAGS["total_liabilities"], instant)
+    rec["minority"], _ = pick(EDINET_TAGS["minority"], instant) if rec["basis"] == "연결" else (0, "")
+    rec["net_income"], _ = pick(EDINET_TAGS["net_income"], duration)
     rec["shares"] = (_num(value.get(("jpcrp_cor:NumberOfIssuedSharesAsOfFiscalYearEndIssuedSharesTotalNumberOfSharesEtc",
                                      "FilingDateInstant_OrdinaryShareMember")))
-                     or pick(EDINET_SHARES, "Instant")[0])
+                     or pick(EDINET_SHARES, instant)[0])
 
-    # 자기주식 등 표: 행마다 이름(NameOfShareholder…)·합계(TotalNumberOfSharesHeld…), 컨텍스트 CurrentYearInstant_RowNMember
+    # 자기주식 등 표: 행마다 이름(NameOfShareholder…)·합계(TotalNumberOfSharesHeld…), 컨텍스트 CurrentYearInstant_RowNMember 등
     me = _edinet_name(rec["name"])
-    own, total = None, _num(value.get(("jpcrp_cor:TotalNumberOfSharesHeldTreasurySharesEtc", "CurrentYearInstant")))
+    own, total = None, _num(value.get(("jpcrp_cor:TotalNumberOfSharesHeldTreasurySharesEtc", instant)))
     for (e, c), v in value.items():
-        if e == "jpcrp_cor:NameOfShareholderTreasurySharesEtc" and _edinet_name(v) == me:
+        if e == "jpcrp_cor:NameOfShareholderTreasurySharesEtc" and c.startswith(instant) and _edinet_name(v) == me:
             own = (own or 0) + (_num(value.get(("jpcrp_cor:TotalNumberOfSharesHeldTreasurySharesEtc", c))) or 0)
     voting = [_num(v) for (e, c), v in value.items()  # 의결권 표: 완전의결권 주식 중 자기보유주식 등
-              if e == "jpcrp_cor:NumberOfSharesIssuedSharesVotingRights" and c.endswith("TreasurySharesEtcMember")]
+              if e == "jpcrp_cor:NumberOfSharesIssuedSharesVotingRights" and c.startswith(instant) and "TreasuryShares" in c]
     if own is not None:
         rec["treasury"], rec["treasury_source"] = own, "자기 명의 행"
     elif total is not None:
@@ -1583,4 +1593,16 @@ def edinet_record(facts: list[dict]) -> dict:
         rec["treasury"], rec["treasury_source"] = sum(v or 0 for v in voting), "의결권 표"
     else:
         rec["treasury"], rec["treasury_source"] = 0, "없음"
+
+    rec["prior"] = None
+    if period != "FY":
+        return rec
+    prior = {"end": dei.get("PreviousFiscalYearEndDateDEI"), "period": "FY", "standard": rec["standard"],
+             "name": rec["name"], "sec_code": rec["sec_code"], "treasury": None, "treasury_source": ""}
+    prior["current_assets"], prior["basis"] = pick(EDINET_TAGS["current_assets"], "Prior1YearInstant")
+    prior["total_liabilities"], _ = pick(EDINET_TAGS["total_liabilities"], "Prior1YearInstant")
+    prior["minority"] = pick(EDINET_TAGS["minority"], "Prior1YearInstant")[0] if prior["basis"] == "연결" else 0
+    prior["net_income"], _ = pick(EDINET_TAGS["net_income"], "Prior1YearDuration")
+    prior["shares"] = pick(EDINET_SHARES, "Prior1YearInstant")[0]
+    rec["prior"] = prior if prior["end"] and prior["current_assets"] is not None else None
     return rec
